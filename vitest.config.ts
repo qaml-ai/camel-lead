@@ -24,5 +24,5 @@ export default defineConfig({
       },
     }),
   ],
-  test: { include: ["test/worker.spec.ts", "test/oauth.spec.ts"], fileParallelism: false },
+  test: { include: ["test/worker.spec.ts", "test/oauth.spec.ts", "test/cimd.spec.ts"], fileParallelism: false },
 });

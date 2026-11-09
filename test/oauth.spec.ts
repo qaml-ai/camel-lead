@@ -86,3 +86,52 @@ it('fails closed on GitHub rate limits and nonmembers', async () => {
   vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 403, headers: { 'x-ratelimit-remaining': '0' } }));
   await expect(githubIdentity('test')).rejects.toMatchObject({ status: 503 });
 });
+
+async function beginCallback() {
+  const { e, params } = await fixture();
+  const page = await call('/authorize?' + params, e);
+  const handle = /name="handle" value="([^"]+)"/.exec(await page.text())![1];
+  const approval = await call('/authorize', e, { method: 'POST', headers: { Cookie: cookies(page), 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ handle, decision: 'approve' }) });
+  expect(approval.status).toBe(302);
+  const state = new URL(approval.headers.get('location')!).searchParams.get('state');
+  return { e, callback: () => call('/oauth/callback?code=private-code&state=' + state, e, { headers: { Cookie: cookies(approval) } }) };
+}
+it('reports GitHub exchange network failures without logging credentials', async () => {
+  const { callback } = await beginCallback();
+  const logs = vi.spyOn(console, 'error').mockImplementation(() => {});
+  vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('private-token private-code private-state'));
+  const response = await callback();
+  expect(response.status).toBe(503);
+  expect(await response.text()).toContain('Restart sign-in');
+  expect(logs.mock.calls).toEqual([[JSON.stringify({ event: 'oauth_operation_failed', stage: 'github_token', kind: 'type_error' })]]);
+});
+it('reports non-JSON GitHub exchange responses without logging the body', async () => {
+  const { callback } = await beginCallback();
+  const logs = vi.spyOn(console, 'error').mockImplementation(() => {});
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('<html>private-token</html>', { headers: { 'Content-Type': 'text/html' } }));
+  const response = await callback();
+  expect(response.status).toBe(503);
+  expect(await response.text()).toContain('invalid response');
+  expect(logs.mock.calls).toEqual([[JSON.stringify({ event: 'oauth_operation_failed', stage: 'github_token', kind: 'invalid_json', status: 200 })]]);
+});
+it('keeps missing mailbox grants forbidden after a successful GitHub exchange', async () => {
+  const { e, callback } = await beginCallback();
+  const projects = JSON.parse(e.PROJECTS_JSON); projects.demo.clients = {};
+  e.PROJECTS_JSON = JSON.stringify(projects);
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+    const url = String(input);
+    if (url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'github-test-only', scope: 'read:org' });
+    if (url === 'https://api.github.com/user') return Response.json({ id: 123 });
+    if (url.endsWith('/memberships/orgs/qaml-ai')) return Response.json({ state: 'active' });
+    throw new Error('Unexpected fetch');
+  });
+  const response = await callback();
+  expect(response.status).toBe(403);
+  expect(await response.text()).toContain('No explicit project mailbox grant');
+});
+it('safely handles invalid GitHub identity response shapes', async () => {
+  const logs = vi.spyOn(console, 'error').mockImplementation(() => {});
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json(null));
+  await expect(githubIdentity('private-token')).rejects.toMatchObject({ status: 503 });
+  expect(logs.mock.calls).toEqual([[JSON.stringify({ event: 'oauth_operation_failed', stage: 'github_user', kind: 'type_error', status: 200 })]]);
+});
