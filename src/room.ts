@@ -3,15 +3,24 @@ import {
   config,
   Failure,
   hash,
+  type ClientConfig,
   type Job,
   type Message,
   type WorkerEnv,
 } from "./types.ts";
+import { automaticEnrollmentLimit, automaticMailboxId, explicitMailbox } from "./enrollment.ts";
+type OAuthMailbox = { id: string; userId: string; oauthClientId: string; suspended: number };
 
 /** One durable mailbox/outbox per project. camelRun, not this object, owns the model loop and memory. */
 export class ProjectRoom extends DurableObject<WorkerEnv> {
   constructor(ctx: DurableObjectState, env: WorkerEnv) {
     super(ctx, env);
+    ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS oauth_mailboxes(id TEXT PRIMARY KEY,userId TEXT NOT NULL,oauthClientId TEXT NOT NULL,suspended INTEGER NOT NULL DEFAULT 0,UNIQUE(userId,oauthClientId))`,
+    );
+    ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY,target TEXT NOT NULL,text TEXT NOT NULL,recipients TEXT NOT NULL)`,
+    );
     ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,client TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL)`,
     );
@@ -25,6 +34,8 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
   async invoke(operation: string, args: unknown[]) {
     try {
       const methods = {
+        resolveOAuthClient: this.resolveOAuthClient,
+        suspendOAuthUser: this.suspendOAuthUser,
         submit: this.submit,
         read: this.read,
         ack: this.ack,
@@ -46,9 +57,51 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
       };
     }
   }
+  /** Internal RPC only: called after browser consent and verified GitHub identity. */
+  async resolveOAuthClient(project: string, userId: string, oauthClientId: string, create = false) {
+    const p = config(this.env, project);
+    const explicit = explicitMailbox(p, userId, oauthClientId);
+    if (explicit) return explicit;
+    const limit = automaticEnrollmentLimit(p, userId, oauthClientId);
+    if (!limit) throw new Failure(403, "No explicit project mailbox grant or automatic enrollment permission for this GitHub user and MCP client");
+    const id = await automaticMailboxId(project, userId, oauthClientId);
+    if (Object.hasOwn(p.clients, id)) throw new Failure(403, "Automatic mailbox conflicts with a configured client");
+    this.ctx.storage.transactionSync(() => {
+      const existing = this.ctx.storage.sql.exec<OAuthMailbox>("SELECT * FROM oauth_mailboxes WHERE id=?", id).toArray()[0];
+      if (existing && (existing.userId !== userId || existing.oauthClientId !== oauthClientId))
+        throw new Failure(403, "Automatic mailbox identity mismatch");
+      if (!existing) {
+        if (!create) throw new Failure(403, "Mailbox not enrolled; restart sign-in from your MCP client");
+        // Count suspended/blocked entries too: rotating DCR IDs cannot evade the cap.
+        const count = this.ctx.storage.sql.exec<{ n: number }>("SELECT count(*) AS n FROM oauth_mailboxes WHERE userId=?", userId).one().n;
+        if (count >= limit) throw new Failure(403, "Automatic client limit reached; reuse a stable client ID or contact the operator");
+        this.ctx.storage.sql.exec("INSERT INTO oauth_mailboxes(id,userId,oauthClientId) VALUES(?,?,?)", id, userId, oauthClientId);
+      } else {
+        // Only a newly verified, live identity can reactivate its own mailbox.
+        this.ctx.storage.sql.exec("UPDATE oauth_mailboxes SET suspended=0 WHERE id=?", id);
+      }
+    });
+    return id;
+  }
+  suspendOAuthUser(project: string, userId: string) {
+    config(this.env, project);
+    this.ctx.storage.sql.exec("UPDATE oauth_mailboxes SET suspended=1 WHERE userId=?", userId);
+  }
+  private clients(project: string): Record<string, ClientConfig> {
+    const p = config(this.env, project), clients = { ...p.clients };
+    for (const row of this.ctx.storage.sql.exec<OAuthMailbox>("SELECT * FROM oauth_mailboxes WHERE suspended=0")) {
+      if (!automaticEnrollmentLimit(p, row.userId, row.oauthClientId) || Object.hasOwn(clients, row.id)) continue;
+      // A newly configured manual mapping replaces, never aliases, the automatic mailbox.
+      try { if (explicitMailbox(p, row.userId, row.oauthClientId)) continue; }
+      catch { continue; }
+      // Client names are self-asserted. Use server-derived attribution instead.
+      clients[row.id] = { name: `GitHub ${row.userId} / MCP ${row.id.slice(3, 15)}` };
+    }
+    return clients;
+  }
   async join(project: string, client: string) {
     const p = config(this.env, project);
-    if (!Object.hasOwn(p.clients, client))
+    if (!Object.hasOwn(this.clients(project), client))
       throw new Failure(403, "Unknown client");
     await this.ctx.storage.put("project", project);
     this.ctx.storage.sql.exec(
@@ -128,7 +181,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
   }
   participants(project: string) {
     const p = config(this.env, project);
-    return Object.entries(p.clients).map(([id, c]) => ({
+    return Object.entries(this.clients(project)).map(([id, c]) => ({
       id,
       name: c.name,
       lastSeen:
@@ -142,8 +195,15 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
   }
   async send(project: string, target: string, text: string, id: string) {
     const p = config(this.env, project);
-    const targets = target === "all" ? Object.keys(p.clients) : [target];
-    if (targets.some((t) => !Object.hasOwn(p.clients, t)))
+    const previous = this.ctx.storage.sql.exec<{ target: string; text: string; recipients: string }>("SELECT * FROM deliveries WHERE id=?", id).toArray()[0];
+    if (previous) {
+      if (previous.target !== target || previous.text !== text) throw new Failure(409, "messageId already used for another message");
+      // Freeze the original recipient set. A retry must not fan out to newly enrolled clients.
+      return { deliveredToMailboxes: JSON.parse(previous.recipients) as string[] };
+    }
+    const clients = this.clients(project);
+    const targets = target === "all" ? Object.keys(clients) : [target];
+    if (targets.some((t) => !Object.hasOwn(clients, t)))
       throw new Failure(404, "Unknown target");
     const existing = this.ctx.storage.sql
       .exec<{ target: string; text: string }>(
@@ -163,6 +223,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     this.ctx.storage.transactionSync(() => {
       for (const t of targets)
         this.insert(`proactive:${id}`, t, text, "message", null);
+      this.ctx.storage.sql.exec("INSERT INTO deliveries(id,target,text,recipients) VALUES(?,?,?,?)", id, target, text, JSON.stringify(targets));
     });
     return { deliveredToMailboxes: targets };
   }
@@ -217,6 +278,8 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     await this.ctx.storage.setAlarm(Date.now() + 5000);
     for (const job of jobs) {
       try {
+        const client = this.clients(project)[job.client];
+        if (!client) throw new Failure(403, "Client access revoked");
         let result: any;
         if (job.state === "queued") {
           result = await this.runtime(
@@ -225,7 +288,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
             {
               text: job.text,
               requestId: job.id,
-              from: { id: job.client, name: p.clients[job.client].name },
+              from: { id: job.client, name: client.name },
               metadata: { source: "camel-lead", client: job.client, project },
             },
           );
@@ -248,6 +311,8 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
                 (r.stopped === "input_required"
                   ? "The lead is waiting for human input; review it in camelRun."
                   : "The lead completed without a text reply.");
+          // Policy may have changed or a revocation may have been observed during network I/O.
+          if (!Object.hasOwn(this.clients(project), job.client)) throw new Failure(403, "Client access revoked");
           this.ctx.storage.transactionSync(() => {
             this.insert(
               `reply:${job.id}`,

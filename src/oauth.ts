@@ -1,5 +1,6 @@
 import { OAuthAuthorizationServer, AuthorizationError, CimdFetchError } from '@cloudflare/workers-oauth-provider';
-import { config, Failure, type ProjectConfig, type WorkerEnv } from './types.ts';
+import { config, Failure, rpc, type ProjectConfig, type WorkerEnv } from './types.ts';
+import { explicitMailbox } from './enrollment.ts';
 
 const SCOPE = 'lead:messages';
 type Props = { githubToken: string; githubUserId: string; project: string; client: string };
@@ -25,10 +26,9 @@ export function server(env: WorkerEnv) {
   });
 }
 export function mappedClient(p: ProjectConfig, userId: string, oauthClientId: string) {
-  const matches = Object.entries(p.clients).filter(([, c]) =>
-    c.github?.userId === userId && c.github.oauthClientId === oauthClientId);
-  if (matches.length !== 1) throw new Failure(403, 'No explicit project mailbox grant for this GitHub user and MCP client');
-  return matches[0][0];
+  const client = explicitMailbox(p, userId, oauthClientId);
+  if (!client) throw new Failure(403, 'No explicit project mailbox grant for this GitHub user and MCP client');
+  return client;
 }
 type GitHubStage = 'github_token' | 'github_user' | 'github_membership';
 function failureKind(error: unknown) {
@@ -86,9 +86,17 @@ export async function oauthClient(request: Request, env: WorkerEnv, project: str
   if (!grant) throw new Failure(401, 'Invalid OAuth credential');
   if (!grant.scope.includes(SCOPE) || grant.props.project !== project) throw new Failure(403, 'Wrong project or scope');
   // Revalidate on every request: removed memberships and revoked GitHub tokens fail closed.
-  const id = await githubIdentity(grant.props.githubToken);
+  let id: string;
+  try { id = await githubIdentity(grant.props.githubToken); }
+  catch (error) {
+    // A definitive upstream revocation disables the user's automatic mailboxes.
+    // Outages/rate limits fail this request closed, but are not revocations.
+    if (error instanceof Failure && error.status === 403)
+      await rpc(env.PROJECTS.getByName(project), 'suspendOAuthUser', project, grant.userId);
+    throw error;
+  }
   if (id !== grant.props.githubUserId || id !== grant.userId) throw new Failure(403, 'GitHub identity changed');
-  const client = mappedClient(p, id, grant.clientId);
+  const client = explicitMailbox(p, id, grant.clientId) ?? await rpc(env.PROJECTS.getByName(project), 'resolveOAuthClient', project, id, grant.clientId, false);
   if (client !== grant.props.client) throw new Failure(403, 'Mailbox grant changed');
   return client;
 }
@@ -109,7 +117,7 @@ export async function oauthRoute(request: Request, env: WorkerEnv, ctx: Executio
       if (!auth.resource || !auth.scope.includes(SCOPE) || auth.scope.some(s => s !== SCOPE)) throw new Failure(400, 'Select a project resource and lead:messages scope');
       const details = await oauth.describeConsent(auth), consent = await oauth.beginConsent(auth);
       consent.headers.set('Content-Type', 'text/html; charset=utf-8');
-      return new Response(`<!doctype html><meta charset="utf-8"><title>Connect camel-lead</title><h1>Connect ${escape(details.clientName)}?</h1>${details.clientDomain ? `<p>Client metadata published by <strong>${escape(details.clientDomain)}</strong>. The app name is self-asserted.</p>` : '<p>This app registered itself; its name is not verified.</p>'}<p>Allow reading and sending project messages. Tokens return to <strong>${escape(details.redirectHost)}</strong>.</p>${details.redirectIsLoopback ? '<p>This connects an app on your computer. Continue only if you started this sign-in.</p>' : ''}<p>Requires qaml-ai membership and an explicit project mailbox grant. Ask the operator to bind your GitHub numeric ID and MCP client ID <code>${escape(auth.clientId)}</code>.</p><form method="post"><input type="hidden" name="handle" value="${escape(consent.handle)}"><button name="decision" value="approve">Continue with GitHub</button><button name="decision" value="deny">Cancel</button></form>`, { headers: consent.headers });
+      return new Response(`<!doctype html><meta charset="utf-8"><title>Connect camel-lead</title><h1>Connect ${escape(details.clientName)}?</h1>${details.clientDomain ? `<p>Client metadata published by <strong>${escape(details.clientDomain)}</strong>. The app name is self-asserted.</p>` : '<p>This app registered itself; its name is not verified.</p>'}<p>Allow reading and sending project messages. Tokens return to <strong>${escape(details.redirectHost)}</strong>.</p>${details.redirectIsLoopback ? '<p>This connects an app on your computer. Continue only if you started this sign-in.</p>' : ''}<p>Requires active qaml-ai membership and project access. If your GitHub account is allowed to connect automatically, this creates or reuses a private delivery mailbox for this exact MCP client ID: <code>${escape(auth.clientId)}</code>. Otherwise, ask the operator for access. All project participants share the lead conversation and memory; model usage is billed to the project.</p><form method="post"><input type="hidden" name="handle" value="${escape(consent.handle)}"><button name="decision" value="approve">Continue with GitHub</button><button name="decision" value="deny">Cancel</button></form>`, { headers: consent.headers });
     }
     if (path === '/authorize' && request.method === 'POST') {
       const form = await request.formData(), handle = String(form.get('handle'));
@@ -143,7 +151,7 @@ export async function oauthRoute(request: Request, env: WorkerEnv, ctx: Executio
       callbackStage = 'project_grant';
       const project = Object.keys(JSON.parse(env.PROJECTS_JSON)).find(p => resource(env, p) === original.resource);
       if (!project) throw new Failure(403, 'Unknown project resource');
-      const client = mappedClient(config(env, project), userId, original.clientId);
+      const client = explicitMailbox(config(env, project), userId, original.clientId) ?? await rpc(env.PROJECTS.getByName(project), 'resolveOAuthClient', project, userId, original.clientId, true);
       callbackStage = 'issue_authorization';
       const { redirectTo } = await oauth.completeAuthorization({ request: original, userId, metadata: { project, client }, scope: [SCOPE], props: { githubToken: upstream.access_token, githubUserId: userId, project, client }, revokeExistingGrants: false });
       headers.set('Location', redirectTo);

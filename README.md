@@ -250,4 +250,4 @@ CI checks every push/PR. There is deliberately **no automatic deployment workflo
 
 ### GitHub organization sign-in
 
-Remote MCP clients can sign in through GitHub, restricted to active `qaml-ai` members with explicit project/mailbox grants. This is separate from the lead's signed runtime identity. See [GitHub OAuth setup, security and client limitations](docs/github-auth.md). Real credentials and a dedicated OAuth KV binding are deployment prerequisites; no Access configuration is required.
+Remote MCP clients can sign in through GitHub, restricted to active `qaml-ai` members. Projects can enable automatic per-user/client mailboxes with `githubAutoEnroll: { "enabled": true }`; otherwise explicit mailbox grants are required. This is separate from the lead's signed runtime identity. See [GitHub OAuth setup, security and client limitations](docs/github-auth.md). Real credentials and a dedicated OAuth KV binding are deployment prerequisites; no Access configuration is required.

@@ -19,10 +19,13 @@ export default defineConfig({
         bindings: {
           CAMELRUN_API_KEY: "runtime-test-only",
           CAMEL_LEAD_URL: "https://lead.test",
-          PROJECTS_JSON: JSON.stringify({ demo: project, other: project }),
+          PROJECTS_JSON: JSON.stringify({ demo: project, other: project,
+            auto: { ...project, clients: {}, githubAutoEnroll: { enabled: true, maxClientsPerUser: 3 } },
+            "auto-other": { ...project, clients: {}, githubAutoEnroll: { enabled: true, maxClientsPerUser: 3 } },
+          }),
         },
       },
     }),
   ],
-  test: { include: ["test/worker.spec.ts", "test/oauth.spec.ts", "test/cimd.spec.ts"], fileParallelism: false },
+  test: { include: ["test/worker.spec.ts", "test/oauth.spec.ts", "test/cimd.spec.ts", "test/enrollment.spec.ts"], fileParallelism: false },
 });

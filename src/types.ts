@@ -9,6 +9,12 @@ export interface ProjectConfig {
   agentId: string;
   tenantId: string;
   clients: Record<string, ClientConfig>;
+  /** Opt-in only. Active qaml-ai membership is still required on every request. */
+  githubAutoEnroll?: {
+    enabled: boolean;
+    maxClientsPerUser?: number;
+    blockedClientIds?: string[];
+  };
 }
 export type Message = {
   seq: number;
