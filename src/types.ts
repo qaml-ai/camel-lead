@@ -168,8 +168,8 @@ export async function waitRead(
   client: string,
   seconds: number,
   after: number,
+  read: () => Promise<Mail> = () => rpc(room, "read", project, client, after),
 ): Promise<Mail> {
-  const read = () => rpc(room, "read", project, client, after);
   const first = await read();
   if (first.events.length || !(seconds > 0)) return first;
   let ws: WebSocket | null = null;

@@ -196,7 +196,7 @@ describe("MCP tools", () => {
       "Check your mailbox now: unacknowledged replies and messages from the lead for this client (up to 50). To wait without checking, use wait_token.",
     );
     expect(tools.wait_token).toBe(
-      "Get a short-lived token and a shell command that waits for your next message from the lead. Run the command in the background: it exits 0 printing the messages when any arrive, 2 if none came before its timeout, 3 if the token expired (call wait_token again). The token can only read this client's mailbox.",
+      "Get a short-lived token and a shell command that waits for your next message from the lead. Run the command in the background: it exits 0 printing the messages when any arrive, 2 if none came before its timeout, 3 if the token expired (call wait_token again). The token can only read this client's mailbox. With follow: true the command keeps running and prints each batch of messages as one line, for clients that can watch a command's output.",
     );
     expect(tools.acknowledge).toBe(
       "Mark messages handled, through the given sequence number. Acknowledge only after you have acted on them.",
@@ -233,6 +233,11 @@ describe("wait tokens", () => {
     expect(minted.command).toContain(`T='${minted.token}'; U='https://lead.test/projects/demo/wait?timeout=50';`);
     expect(minted.command).toContain("+ 3600 ))");
     expect((await tool("wait_token", { timeoutSeconds: 86400 })).command).toContain("+ 86400 ))");
+    expect(minted.command).toContain("exit 0;;");
+    const following = (await tool("wait_token", { follow: true })).command;
+    expect(following).toContain('"$U&after=$A"');
+    expect(following).not.toContain("exit 0;;");
+    expect((await mcpTool("wait_token", { follow: "yes" })).isError).toBe(true);
     await send("bob", "for bob");
     expect((await wait(minted.token, "?timeout=1")).status).toBe(204);
     const waiting = waitFor(minted.token, "?timeout=30");
@@ -286,6 +291,31 @@ describe("wait tokens", () => {
     }
     // No script is hosted: the command is self-contained.
     expect((await exports.default.fetch("https://lead.test/wait.sh")).status).toBe(404);
+  });
+  it("ends a parked wait with 401 as soon as its client is suspended or its token dies", async () => {
+    const auto = env.PROJECTS.getByName("auto");
+    const call = async (operation: string, ...args: unknown[]) => {
+      const reply = await auto.invoke(operation, args);
+      expect(reply.ok).toBe(true);
+      return reply.value;
+    };
+    const client = await call("resolveOAuthClient", "auto", "12345", "https://client.test/id", true);
+    const { token } = await call("mintWaitToken", "auto", client, 5);
+    const parked = waitFetch(token, "?timeout=30", "auto");
+    expect(await settled(parked)).toBe(false);
+    const started = Date.now();
+    await call("suspendOAuthUser", "auto", "12345");
+    expect((await parked).status).toBe(401);
+    expect(Date.now() - started).toBeLessThan(3000);
+    // A token that expires during a wait is refused when the wait ends, even if mail came.
+    const mine = await mint();
+    const waiting = waitFetch(mine, "?timeout=30");
+    expect(await settled(waiting)).toBe(false);
+    await runInDurableObject(room(), (_o: ProjectRoom, state) => {
+      state.storage.sql.exec("UPDATE wait_tokens SET expires=0");
+    });
+    await send("alice", "too late");
+    expect((await waiting).status).toBe(401);
   });
   it("stores only hashes, expires, and keeps at most five tokens per client", async () => {
     const tokens: string[] = [];

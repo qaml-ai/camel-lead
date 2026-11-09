@@ -48,6 +48,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
         read: this.read,
         mintWaitToken: this.mintWaitToken,
         waitTokenClient: this.waitTokenClient,
+        waitTokenRead: this.waitTokenRead,
         ack: this.ack,
         participants: this.participants,
         send: this.send,
@@ -96,6 +97,12 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
   suspendOAuthUser(project: string, userId: string) {
     config(this.env, project);
     this.ctx.storage.sql.exec("UPDATE oauth_mailboxes SET suspended=1 WHERE userId=?", userId);
+    // End this user's parked waits now; their next read is refused.
+    for (const row of this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM oauth_mailboxes WHERE userId=?", userId))
+      for (const ws of this.ctx.getWebSockets(row.id))
+        try {
+          ws.close(4401, "Access ended");
+        } catch {}
   }
   private clients(project: string): Record<string, ClientConfig> {
     const p = config(this.env, project), clients = { ...p.clients };
@@ -218,6 +225,10 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     // A removed or suspended client's tokens stop working with it.
     if (!row || !Object.hasOwn(this.clients(project), row.client)) throw refused;
     return row.client;
+  }
+  /** A token's read checks the token every time, so a wait that outlives its token ends with 401. */
+  async waitTokenRead(project: string, token: string, after = 0) {
+    return this.read(project, await this.waitTokenClient(project, token), after);
   }
   /** Signal this client's waiting requests. Runs after the write that queued it has committed. */
   private flush() {

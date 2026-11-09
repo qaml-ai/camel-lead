@@ -61,7 +61,9 @@ export default {
           timeout: optional(url.searchParams.get("timeout")),
           after: optional(url.searchParams.get("after")),
         });
-        const mail = await waitRead(room, project, owner, q.timeout, q.after);
+        const mail = await waitRead(room, project, owner, q.timeout, q.after, () =>
+          rpc(room, "waitTokenRead", project, token, q.after),
+        );
         // 200 with mail, 204 with nothing yet: a shell loop needs only the status.
         return mail.events.length
           ? Response.json(mail, { headers: { "Cache-Control": "no-store" } })

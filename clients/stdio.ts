@@ -47,10 +47,11 @@ server.registerTool(
   "wait_token",
   {
     description:
-      "Get a short-lived token and a shell command that waits for your next message from the lead. Run the command in the background: it exits 0 printing the messages when any arrive, 2 if none came before its timeout, 3 if the token expired (call wait_token again). The token can only read this client's mailbox.",
+      "Get a short-lived token and a shell command that waits for your next message from the lead. Run the command in the background: it exits 0 printing the messages when any arrive, 2 if none came before its timeout, 3 if the token expired (call wait_token again). The token can only read this client's mailbox. With follow: true the command keeps running and prints each batch of messages as one line, for clients that can watch a command's output.",
     inputSchema: {
       ttlMinutes: z.number().int().min(5).max(1440).optional(),
       timeoutSeconds: z.number().int().min(60).max(86400).optional(),
+      follow: z.boolean().optional(),
     },
   },
   async (args) => result(await client.call("wait-token", args)),

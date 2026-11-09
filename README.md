@@ -187,7 +187,7 @@ tool answers at once; no tool call blocks.
   it printed, handle it, `acknowledge` it, and start the command again. No
   model tokens are spent while it waits.
 
-`wait_token({ ttlMinutes?, timeoutSeconds? })` returns `{ token, expiresAt, url,
+`wait_token({ ttlMinutes?, timeoutSeconds?, follow? })` returns `{ token, expiresAt, url,
 command }`. `ttlMinutes` is the token's life (5 to 1440, default 480).
 `timeoutSeconds` is how long the command waits overall (60 to 86400, default
 3600). The command is one self-contained POSIX `sh` line that needs only `curl`;
@@ -198,9 +198,24 @@ nothing is downloaded. Its exit codes:
 | `0`  | Mail arrived; the messages are printed as JSON (`{"events":[...],"next":N}`) |
 | `2`  | Nothing arrived before the timeout; start it again to keep waiting          |
 | `3`  | The token expired or was replaced; call `wait_token` again                  |
+| `4`  | Permanent refusal (HTTP 400, 403 or 404): check the project and URL, or call `wait_token` again |
 
-It retries network and server errors every 5 seconds. It never acknowledges:
+It retries network errors, HTTP 429 and server errors every 5 seconds. It never acknowledges:
 until `acknowledge` is called, the same messages are printed again.
+
+### One long-running command
+
+With `follow: true` the command does not exit on mail. It prints each batch of
+messages as one line of JSON and keeps waiting, moving past what it printed so
+nothing is printed twice, until the overall timeout (exit `2`) or a refusal
+(exit `3` or `4`). You still `acknowledge` what you have handled.
+
+- Use the default (exit per message) wherever a background command's exit wakes
+  the agent. It works in every harness that can run one.
+- Use `follow` only when the harness surfaces a running command's output lines
+  as events, for example a monitor or watch tool. One command then covers the
+  whole session; in a harness that only reports on exit, its output would sit
+  unread.
 
 ### The raw protocol
 
@@ -216,8 +231,10 @@ Authorization: Bearer <wait token>
   to that number without acknowledging them.
 - `204` with an empty body when `timeout` seconds pass with nothing (default 25;
   larger values are clamped to 50). Ask again.
-- `401` when the token is unknown, expired or replaced. `429` when too many
-  requests are already waiting; retry after a pause.
+- `401` when the token is unknown, expired or replaced, or its client was
+  removed or suspended. A waiting request ends with it at once on suspension,
+  otherwise when its wait ends. `429` when too many requests are already
+  waiting; retry after a pause.
 
 The stateless Worker holds the request. The project's Durable Object only keeps
 a hibernatable WebSocket per waiting request and can sleep until mail arrives,
