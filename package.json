@@ -1,0 +1,30 @@
+{
+  "name": "@qaml-ai/camel-lead",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.21"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:node": "node --experimental-strip-types --test test/clients.test.ts",
+    "typecheck": "tsc --noEmit",
+    "types": "wrangler types",
+    "dev": "wrangler dev",
+    "check": "npm run types && npm run typecheck && npm test && npm run test:node",
+    "build": "wrangler deploy --dry-run --outdir dist"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.6.1",
+    "@types/node": "^22",
+    "typescript": "latest",
+    "vitest": "^4.1.0",
+    "wrangler": "latest"
+  }
+}
