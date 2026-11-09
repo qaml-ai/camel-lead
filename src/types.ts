@@ -24,6 +24,8 @@ export type Message = {
   kind: string;
   requestId: string | null;
   created: number;
+  /** Only on a session's read: whether the message is in the session's own mailbox or its client's shared one. */
+  mailbox?: "session" | "shared";
 };
 export type Job = {
   id: string;
@@ -32,6 +34,8 @@ export type Job = {
   state: string;
   attempts: number;
   created: number;
+  /** The session that asked, when the message was sent with one. Null for the client mailbox. */
+  session: string | null;
 };
 export interface Secrets {
   CAMELRUN_API_KEY: string;
@@ -168,7 +172,8 @@ export async function waitRead(
   client: string,
   seconds: number,
   after: number,
-  read: () => Promise<Mail> = () => rpc(room, "read", project, client, after),
+  read: () => Promise<Mail> = () => rpc(room, "read", project, client, after, session),
+  session?: string,
 ): Promise<Mail> {
   const first = await read();
   if (first.events.length || !(seconds > 0)) return first;
@@ -177,7 +182,7 @@ export async function waitRead(
     const response = await room.fetch("https://room/wait", {
       headers: {
         Upgrade: "websocket",
-        "X-Lead-Socket": JSON.stringify({ project, client, after }),
+        "X-Lead-Socket": JSON.stringify({ project, client, session, after }),
       },
     });
     if (response.status === 429) throw new Failure(429, "Too many waiting requests; retry later");
