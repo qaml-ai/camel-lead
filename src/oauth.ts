@@ -42,6 +42,8 @@ function logOAuthFailure(stage: string, kind: string, status?: number) {
   // Never log URLs, bodies, tokens, codes, state, error messages or stacks.
   console.error(JSON.stringify({ event: 'oauth_operation_failed', stage, kind, ...(status === undefined ? {} : { status }) }));
 }
+// Workers does not implement redirect: 'error'. Use manual and reject non-2xx
+// responses below, so credentials are never forwarded to a redirect destination.
 async function githubFetch(stage: GitHubStage, url: string, init: RequestInit) {
   try { return await fetch(url, init); }
   catch (error) {
@@ -63,7 +65,7 @@ async function github(path: string, token: string) {
   const stage: GitHubStage = path === '/user' ? 'github_user' : 'github_membership';
   const response = await githubFetch(stage, `https://api.github.com${path}`, {
     headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'camel-lead' },
-    signal: AbortSignal.timeout(10000), redirect: 'error',
+    signal: AbortSignal.timeout(10000), redirect: 'manual',
   });
   if (response.status === 429 || response.status >= 500 || (response.status === 403 && response.headers.get('x-ratelimit-remaining') === '0'))
     throw new Failure(503, 'GitHub authorization temporarily unavailable');
@@ -130,7 +132,7 @@ export async function oauthRoute(request: Request, env: WorkerEnv, ctx: Executio
       if (!data || typeof data.verifier !== 'string') throw new Failure(400, 'Authorization failed or expired. Restart from your MCP client.');
       callbackStage = 'github_token';
       const response = await githubFetch('github_token', 'https://github.com/login/oauth/access_token', {
-        method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'camel-lead' }, redirect: 'error', signal: AbortSignal.timeout(10000),
+        method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'camel-lead' }, redirect: 'manual', signal: AbortSignal.timeout(10000),
         body: JSON.stringify({ client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, code, code_verifier: data.verifier, redirect_uri: `${env.CAMEL_LEAD_URL}/oauth/callback` }),
       });
       if (!response.ok) throw new Failure(503, 'GitHub token exchange failed');

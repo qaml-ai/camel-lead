@@ -51,7 +51,11 @@ it('performs browser consent, GitHub PKCE, MCP OAuth issuance, audience isolatio
   expect(upstream.searchParams.get('code_challenge_method')).toBe('S256');
   let revoked = false;
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: RequestInit) => {
-    const url = input instanceof Request ? input.url : String(input);
+    // Construct using workerd's real Request API before mocking the network.
+    // A mock that ignores init hides unsupported redirect modes in production.
+    const outgoing = new Request(input, init);
+    expect(outgoing.redirect).toBe('manual');
+    const url = outgoing.url;
     if (url === 'https://github.com/login/oauth/access_token') {
       expect(JSON.parse(String(init!.body)).code_verifier).toBeTruthy();
       return Response.json({ access_token: 'github-test-only', scope: 'read:org' });
@@ -134,4 +138,27 @@ it('safely handles invalid GitHub identity response shapes', async () => {
   vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json(null));
   await expect(githubIdentity('private-token')).rejects.toMatchObject({ status: 503 });
   expect(logs.mock.calls).toEqual([[JSON.stringify({ event: 'oauth_operation_failed', stage: 'github_user', kind: 'type_error', status: 200 })]]);
+});
+it('rejects GitHub token redirects without forwarding the secret or code', async () => {
+  const { callback } = await beginCallback();
+  const outbound = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: RequestInit) => {
+    const request = new Request(input, init);
+    expect(request.url).toBe('https://github.com/login/oauth/access_token');
+    expect(request.redirect).toBe('manual');
+    return new Response(null, { status: 307, headers: { Location: 'https://unexpected.test/token' } });
+  });
+  const response = await callback();
+  expect(response.status).toBe(503);
+  expect(await response.text()).toContain('GitHub token exchange failed');
+  expect(outbound).toHaveBeenCalledTimes(1);
+});
+it('rejects GitHub identity redirects without forwarding the bearer token', async () => {
+  const outbound = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: RequestInit) => {
+    const request = new Request(input, init);
+    expect(request.url).toBe('https://api.github.com/user');
+    expect(request.redirect).toBe('manual');
+    return new Response(null, { status: 302, headers: { Location: 'https://unexpected.test/user' } });
+  });
+  await expect(githubIdentity('private-token')).rejects.toMatchObject({ status: 403 });
+  expect(outbound).toHaveBeenCalledTimes(1);
 });
