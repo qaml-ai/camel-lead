@@ -257,6 +257,7 @@ describe("project delivery", () => {
       })
     ).json();
     expect(client.result.tools.map((t: any) => t.name)).toEqual([
+      "join",
       "message",
       "get_messages",
       "wait_token",

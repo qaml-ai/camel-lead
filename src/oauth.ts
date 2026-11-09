@@ -77,7 +77,16 @@ export async function githubIdentity(token: string) {
   if (typeof user.id !== 'number' || !Number.isSafeInteger(user.id) || user.id <= 0) throw new Failure(403, 'Invalid GitHub identity');
   const membership = await github('/user/memberships/orgs/qaml-ai', token);
   if (membership.state !== 'active') throw new Failure(403, 'Active qaml-ai membership required');
-  return String(user.id);
+  // The same verified response names the person: login, and the profile's display name when set.
+  const login = typeof user.login === 'string' ? user.login : '';
+  return { id: String(user.id), login, name: typeof user.name === 'string' && user.name.trim() ? user.name : login };
+}
+/** The mailbox for a verified GitHub user and exact OAuth client. Either way the room learns the person's name. */
+async function resolve(env: WorkerEnv, project: string, p: ProjectConfig, userId: string, oauthClientId: string, create: boolean, profile: { login: string; name: string }) {
+  const room = env.PROJECTS.getByName(project), explicit = explicitMailbox(p, userId, oauthClientId);
+  if (!explicit) return rpc(room, 'resolveOAuthClient', project, userId, oauthClientId, create, profile) as Promise<string>;
+  await rpc(room, 'recordIdentity', project, userId, profile);
+  return explicit;
 }
 export async function oauthClient(request: Request, env: WorkerEnv, project: string, p: ProjectConfig) {
   const token = /^Bearer\s+(\S+)$/i.exec(request.headers.get('authorization') || '')?.[1];
@@ -86,8 +95,8 @@ export async function oauthClient(request: Request, env: WorkerEnv, project: str
   if (!grant) throw new Failure(401, 'Invalid OAuth credential');
   if (!grant.scope.includes(SCOPE) || grant.props.project !== project) throw new Failure(403, 'Wrong project or scope');
   // Revalidate on every request: removed memberships and revoked GitHub tokens fail closed.
-  let id: string;
-  try { id = await githubIdentity(grant.props.githubToken); }
+  let id: string, profile: { login: string; name: string };
+  try { ({ id, ...profile } = await githubIdentity(grant.props.githubToken)); }
   catch (error) {
     // A definitive upstream revocation disables the user's automatic mailboxes.
     // Outages/rate limits fail this request closed, but are not revocations.
@@ -96,7 +105,8 @@ export async function oauthClient(request: Request, env: WorkerEnv, project: str
     throw error;
   }
   if (id !== grant.props.githubUserId || id !== grant.userId) throw new Failure(403, 'GitHub identity changed');
-  const client = explicitMailbox(p, id, grant.clientId) ?? await rpc(env.PROJECTS.getByName(project), 'resolveOAuthClient', project, id, grant.clientId, false);
+  // The room also keeps the verified login and name, so enrollments made before names were stored get one here.
+  const client = await resolve(env, project, p, id, grant.clientId, false, profile);
   if (client !== grant.props.client) throw new Failure(403, 'Mailbox grant changed');
   return client;
 }
@@ -147,11 +157,11 @@ export async function oauthRoute(request: Request, env: WorkerEnv, ctx: Executio
       const upstream = await githubJson('github_token', response);
       if (typeof upstream.access_token !== 'string' || typeof upstream.scope !== 'string' || !upstream.scope.split(/[ ,]+/).includes('read:org')) throw new Failure(403, 'GitHub read:org permission required');
       callbackStage = 'github_identity';
-      const userId = await githubIdentity(upstream.access_token);
+      const { id: userId, ...profile } = await githubIdentity(upstream.access_token);
       callbackStage = 'project_grant';
       const project = Object.keys(JSON.parse(env.PROJECTS_JSON)).find(p => resource(env, p) === original.resource);
       if (!project) throw new Failure(403, 'Unknown project resource');
-      const client = explicitMailbox(config(env, project), userId, original.clientId) ?? await rpc(env.PROJECTS.getByName(project), 'resolveOAuthClient', project, userId, original.clientId, true);
+      const client = await resolve(env, project, config(env, project), userId, original.clientId, true, profile);
       callbackStage = 'issue_authorization';
       const { redirectTo } = await oauth.completeAuthorization({ request: original, userId, metadata: { project, client }, scope: [SCOPE], props: { githubToken: upstream.access_token, githubUserId: userId, project, client }, revokeExistingGrants: false });
       headers.set('Location', redirectTo);

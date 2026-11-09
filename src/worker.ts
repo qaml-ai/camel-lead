@@ -19,11 +19,17 @@ const tokenWaitQuery = z.object({
   timeout: z.coerce.number().int().min(0).default(25).transform((n) => Math.min(n, MAX_WAIT_SECONDS)),
   after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
 });
-const ackBody = z.object({ seq: z.number().int().nonnegative() });
+const session = z.string().min(1).max(80).optional();
+const ackBody = z.object({ seq: z.number().int().nonnegative(), session });
+const joinBody = z.object({
+  name: z.string(),
+  clientInfo: z.object({ name: z.string().max(200), version: z.string().max(200).optional() }).optional(),
+});
 const origin = (env: WorkerEnv) => env.CAMEL_LEAD_URL.replace(/\/+$/, "");
 const message = z.object({
   text: z.string().min(1).max(16_000),
   requestId: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
+  session,
 });
 export default {
   async fetch(request: Request, env: WorkerEnv, ctx: ExecutionContext): Promise<Response> {
@@ -33,7 +39,7 @@ export default {
       if (authResponse) return authResponse;
       if (url.pathname === "/healthz") return Response.json({ ok: true });
       const match =
-        /^\/(projects|agent)\/([A-Za-z0-9_-]{1,80})\/(mcp|messages|ack|participants|send|wait|wait-token)$/.exec(
+        /^\/(projects|agent)\/([A-Za-z0-9_-]{1,80})\/(mcp|messages|ack|participants|send|wait|wait-token|join)$/.exec(
           url.pathname,
         );
       if (!match) throw new Failure(404, "Not found");
@@ -56,13 +62,19 @@ export default {
         // The only blocking read. A wait token is accepted here and nowhere else, and can only read.
         if (request.method !== "GET") throw new Failure(405, "Method not allowed");
         const token = /^Bearer (\S+)$/.exec(request.headers.get("authorization") || "")?.[1] || "";
-        const owner: string = await rpc(room, "waitTokenClient", project, token);
+        const owner: { client: string; session?: string } = await rpc(room, "waitTokenOwner", project, token);
         const q = tokenWaitQuery.parse({
           timeout: optional(url.searchParams.get("timeout")),
           after: optional(url.searchParams.get("after")),
         });
-        const mail = await waitRead(room, project, owner, q.timeout, q.after, () =>
-          rpc(room, "waitTokenRead", project, token, q.after),
+        const mail = await waitRead(
+          room,
+          project,
+          owner.client,
+          q.timeout,
+          q.after,
+          () => rpc(room, "waitTokenRead", project, token, q.after),
+          owner.session,
         );
         // 200 with mail, 204 with nothing yet: a shell loop needs only the status.
         return mail.events.length
@@ -95,20 +107,25 @@ export default {
           await mintWait(room, origin(env), project, client, await boundedJson(request)),
           { headers: { "Cache-Control": "no-store" } },
         );
+      if (action === "join" && request.method === "POST") {
+        const body = joinBody.parse(await boundedJson(request));
+        return Response.json(await rpc(room, "joinSession", project, client, body.name, body.clientInfo));
+      }
       if (action === "messages" && request.method === "GET")
-        return Response.json(await rpc(room, "read", project, client), {
-          headers: { "Cache-Control": "no-store" },
-        });
+        return Response.json(
+          await rpc(room, "read", project, client, 0, session.parse(optional(url.searchParams.get("session")))),
+          { headers: { "Cache-Control": "no-store" } },
+        );
       if (action === "messages" && request.method === "POST") {
         const body = message.parse(await boundedJson(request));
         return Response.json(
-          await rpc(room, "submit", project, client, body.requestId, body.text),
+          await rpc(room, "submit", project, client, body.requestId, body.text, body.session),
           { status: 202 },
         );
       }
       if (action === "ack" && request.method === "POST") {
-        const { seq } = ackBody.parse(await boundedJson(request));
-        return Response.json(await rpc(room, "ack", project, client, seq));
+        const body = ackBody.parse(await boundedJson(request));
+        return Response.json(await rpc(room, "ack", project, client, body.seq, body.session));
       }
       if (action === "participants" && request.method === "GET")
         return Response.json(await rpc(room, "participants", project));
@@ -138,8 +155,8 @@ export default {
         },
         { status, headers: {
           "Cache-Control": "no-store",
-          ...(status === 401 && oauthEnabled(env) && /^\/projects\/[^/]+\/(mcp|messages|ack|participants|wait-token)$/.test(new URL(request.url).pathname) ? {
-            'WWW-Authenticate': `Bearer resource_metadata="${env.CAMEL_LEAD_URL}/.well-known/oauth-protected-resource${new URL(request.url).pathname.replace(/\/(messages|ack|participants|wait-token)$/, '/mcp')}", scope="lead:messages"`
+          ...(status === 401 && oauthEnabled(env) && /^\/projects\/[^/]+\/(mcp|messages|ack|participants|wait-token|join)$/.test(new URL(request.url).pathname) ? {
+            'WWW-Authenticate': `Bearer resource_metadata="${env.CAMEL_LEAD_URL}/.well-known/oauth-protected-resource${new URL(request.url).pathname.replace(/\/(messages|ack|participants|wait-token|join)$/, '/mcp')}", scope="lead:messages"`
           } : {}),
         } },
       );

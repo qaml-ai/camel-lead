@@ -7,14 +7,16 @@ Worker delivers messages between the lead and its connected collaborators.
 The lead's interface is deliberately small:
 
 ```text
-participants()                         # authorized clients and last adapter contact
-send_message(target, text, messageId)   # one client, or target="all"
+participants()                         # people, their clients and named sessions, with ids
+send_message(target, text, messageId)   # a session id, a client id, or target="all"
 ```
 
-Clients use `message`, `get_messages`, `acknowledge`, `participants` and
+Clients use `join`, `message`, `get_messages`, `acknowledge`, `participants` and
 `wait_token`. Multiple clients can submit simultaneously to **one shared agent
 and conversation**. camelRun serializes their turns. A normal final reply goes
 back to its caller; the lead can also proactively message any authorized client.
+Each participant has a readable name such as `Miguel's Claude Code · chiridion-2`,
+and each [named session](#names-and-sessions) has its own mailbox.
 Durable SQLite mailboxes preserve messages when a client disconnects. No VM,
 helper process or permanent socket is needed.
 
@@ -174,10 +176,57 @@ claude mcp add project-lead -- node --experimental-strip-types /absolute/path/ca
 Register that command using the client's normal MCP configuration. Do not commit
 credential values; pass them through its supported environment mechanism.
 
+### Names and sessions
+
+Participants are shown to the lead and to each other as
+`<Person>'s <Client>`, or `<Person>'s <Client> · <session name>` for a named
+session: `Miguel's Claude Code · chiridion-2`.
+
+- **Person** comes from verified identity, never from a tool argument: the
+  GitHub profile name (else the login) for GitHub sign-in, or the registry's
+  `name` for a static bearer client. An enrollment made before names were stored
+  shows as `GitHub <id>` until its next request, which stores the name.
+- **Client** comes from the MCP `clientInfo` the client sends in `initialize`
+  (`Claude Code`, `Codex`, `pi`, `Cursor`; otherwise its own name, shortened;
+  `agent` when unknown). It is a self-reported label, not an identity. The stdio
+  adapter relays its coding client's name when it joins.
+- **Session** is chosen by the agent. One client install often runs several
+  agents (two repositories, two tasks); without sessions they would share one
+  mailbox.
+
+`join({ name })` creates or resumes a named session under the calling client and
+returns `{ session, displayName }`. The name is 1 to 40 printable characters on
+one line: the repository or task. Joining again with the same name returns the
+same session id and mailbox, so an agent that lost its context gets its mail
+back. `message`, `get_messages`, `acknowledge` and `wait_token` take that id as
+an optional `session`:
+
+- A `message` sent with a session is shown to the lead as from that session,
+  and the lead's reply goes to that session's mailbox.
+- A session reads and acknowledges only its own mailbox. Another client's
+  session id is refused like an unknown one.
+- Without `session`, every tool uses the client's own mailbox exactly as before,
+  so clients that never call `join` keep working.
+
+The lead's `send_message` takes a session id, a client id or `"all"`. A message
+to a client (or to all) is copied into the mailbox of each of that client's live
+sessions (seen in the last 24 hours), or into the client mailbox when it has
+none. Each copy is acknowledged separately.
+
+A client may have 20 live sessions; joining a 21st ends the longest-idle one if
+it has not been seen for a day, and is refused otherwise. A session not seen
+for 7 days ends. When a session ends, its unacknowledged messages move to the
+client mailbox, and joining again with its name starts it afresh under the same id.
+
+The REST routes used by the stdio adapter take the same optional `session`
+(`POST /projects/<project>/join` with `{ "name": ... }`, then `session` in the
+body of `messages`, `ack` and `wait-token`, or `?session=` on `GET messages`).
+
 ## Waiting for the lead
 
-Replies and messages from the lead arrive in the client's mailbox. Every MCP
-tool answers at once; no tool call blocks.
+Replies and messages from the lead arrive in the mailbox of the session that
+was used (or the client's, without one). Every MCP tool answers at once; no tool
+call blocks.
 
 - **Check when convenient:** `get_messages` returns the unacknowledged messages
   (or an empty list). `acknowledge` what you have handled.
@@ -187,8 +236,8 @@ tool answers at once; no tool call blocks.
   it printed, handle it, `acknowledge` it, and start the command again. No
   model tokens are spent while it waits.
 
-`wait_token({ ttlMinutes?, timeoutSeconds?, follow? })` returns `{ token, expiresAt, url,
-command }`. `ttlMinutes` is the token's life (5 to 1440, default 480).
+`wait_token({ ttlMinutes?, timeoutSeconds?, follow?, session? })` returns `{ token, expiresAt, url,
+command }`. With `session`, the token reads only that session's mailbox. `ttlMinutes` is the token's life (5 to 1440, default 480).
 `timeoutSeconds` is how long the command waits overall (60 to 86400, default
 3600). The command is one self-contained POSIX `sh` line that needs only `curl`;
 nothing is downloaded. Its exit codes:
@@ -231,8 +280,8 @@ Authorization: Bearer <wait token>
   to that number without acknowledging them.
 - `204` with an empty body when `timeout` seconds pass with nothing (default 25;
   larger values are clamped to 50). Ask again.
-- `401` when the token is unknown, expired or replaced, or its client was
-  removed or suspended. A waiting request ends with it at once on suspension,
+- `401` when the token is unknown, expired or replaced, its client was
+  removed or suspended, or its session ended. A waiting request ends with it at once on suspension,
   otherwise when its wait ends. `429` when too many requests are already
   waiting; retry after a pause.
 
@@ -245,10 +294,11 @@ so waiting costs wall-clock time, not compute.
 - **Read-only.** A token can only read on the route above. It cannot send,
   acknowledge, list participants, mint tokens or use MCP, and client
   credentials are not accepted on that route.
-- **One client, one project.** It reads only the mailbox of the client that
-  minted it, in that project. Removing or suspending the client stops its tokens.
+- **One mailbox, one project.** It reads only the mailbox it was minted for,
+  in that project: the client's own, or with `session` only that session's.
+  Removing or suspending the client, or the session ending, stops its tokens.
 - **Short-lived.** It expires after `ttlMinutes`. Only its SHA-256 hash is stored.
-- **Five live tokens per client.** Minting a sixth drops the oldest; mint anew
+- **Five live tokens per mailbox.** Minting a sixth drops the oldest; mint anew
   to rotate.
 - **It appears in the model's context** and in the shell command, so treat it as
   readable by whatever can read the conversation. That is why it is narrow.
@@ -257,8 +307,9 @@ so waiting costs wall-clock time, not compute.
 ## Delivery and safety
 
 - Server-assigned client identity comes from bearer authentication, never a model
-  argument. Clients can read/ack only their own mailbox. All collaborators still
-  share the lead's conversation and memory by design.
+  argument. Clients can read/ack only their own mailbox and their own sessions'
+  mailboxes; a session name only labels a mailbox under the authenticated client.
+  All collaborators still share the lead's conversation and memory by design.
 - Runtime prompts use stable request IDs. Ambiguous retries reuse the same ID.
   Alarm-driven outbox delivery and reply persistence survive DO eviction.
 - Mailbox messages remain until explicitly acknowledged. Acknowledgement hides
@@ -269,7 +320,7 @@ so waiting costs wall-clock time, not compute.
 - Waiting requests hold no state that matters. If the Durable Object or Worker
   restarts, the request ends, the command asks again, and the durable mailbox
   answers.
-- Each client may have 4 requests waiting at once and each project 256 (HTTP 429
+- Each mailbox may have 4 requests waiting at once and each project 256 (HTTP 429
   beyond that; an abandoned request frees its place within 50 seconds).
 - Normal lead replies and proactive tool messages are separate. The lead is
   instructed not to send duplicate final replies or endless agent-to-agent loops.
@@ -292,7 +343,8 @@ The `healthz` route is public; all project/lead operations require credentials.
 `npm test` runs actual Workers/Durable Objects tests: authorization, concurrent
 clients, idempotency, private routing, broadcast, eviction persistence, outbox
 retries, live MCP wire contracts, the blocking read across hibernation, wait-token
-scope and bounds. `npm run test:node` checks the stdio adapter, runs the generated
+scope and bounds, readable names, and session mailboxes (isolation, routing,
+fan-out, expiry, and opening a room stored by an earlier version). `npm run test:node` checks the stdio adapter, runs the generated
 wait command with `sh` against a synthetic server for each exit code, and checks
 provisioning contracts. These are not claims of
 live provider interoperability.
