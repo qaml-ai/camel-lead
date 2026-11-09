@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "camel-lead": {
+      "type": "http",
+      "url": "${CAMEL_LEAD_MCP_URL:-https://camel-lead.miguel-85b.workers.dev/projects/camel-lead/mcp}"
+    }
+  }
+}
