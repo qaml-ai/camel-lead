@@ -52,7 +52,7 @@ existing Cloudflare deployment discovered on November 9, 2026. Override
 `CAMELRUN_URL` for another deployment. No account IDs, credentials or existing
 production routes are included. `workers_dev` is disabled by default.
 
-Create one lead/definition and its dedicated Dreaming volume (this command makes
+Create one lead agent and its dedicated Dreaming volume (this command makes
 real API changes; it does not deploy anything):
 
 ```sh
@@ -63,8 +63,8 @@ node --experimental-strip-types scripts/provision.ts demo https://lead.example.c
 ```
 
 The script writes private mode-0600 files under `.secrets/demo/`, including a
-journal of created resource IDs, per-client credentials, a separate lead-tool
-credential, and `projects.json`. It never prints credentials. If interrupted,
+journal of created resource IDs, per-client credentials, `activation.json`, and
+`projects.json`. No lead shared secret or private signing key is created. It never prints credentials. If interrupted,
 inspect the journal; do not delete the directory and blindly repeat. Existing
 setup directories are refused. Resources are not automatically deleted on error.
 
@@ -75,7 +75,7 @@ private files/secure input, not literals in source. `PROJECTS_JSON` is a registr
 {
   "demo": {
     "agentId": "client_<40 hex characters>",
-    "leadTokenHash": "<sha256 hex>",
+    "tenantId": "<your camelRun tenant id>",
     "clients": {
       "alice": { "name": "Alice", "tokenHash": "<sha256 hex>" },
       "bob": { "name": "Bob", "tokenHash": "<sha256 hex>" }
@@ -87,11 +87,20 @@ private files/secure input, not literals in source. `PROJECTS_JSON` is a registr
 Merge project entries when adding a project; do not overwrite another project's
 registry. Each project should have its **own** agent and memory volume. Rotate or
 remove a client by updating its registry entry. Keep the camelRun API key only in
-the adapter. The lead's separate bearer credential permits only delivery and
-participant listing for that project, not incoming client messages.
+the adapter. The lead authenticates with camelRun's signed identity tokens;
+clients' static bearer credentials are not accepted on the lead endpoint.
 
-After review, configure a route and deploy this Worker separately. No deployment
-was performed during development. An optional `RUNTIME` service binding can point
+After review, configure `CAMEL_LEAD_URL` to match the public origin, configure a
+route and deploy this Worker separately. Then attach its MCP tools:
+
+```sh
+node --experimental-strip-types scripts/activate.ts demo
+```
+
+Bootstrap creates the agent with immutable project context but no MCP source.
+Activation happens only after the adapter knows the exact agent and tenant; it
+avoids a tool-discovery/authentication bootstrap cycle. No deployment was
+performed during development. An optional `RUNTIME` service binding can point
 to `camelrun-pilot` in the same Cloudflare account; requests retain their normal
 URL and API authorization. Without it, the adapter uses authenticated HTTPS.
 
@@ -107,6 +116,39 @@ replaced by consolidation; do not store unrelated files in it. Keep the upstream
 Workers minute cron enabled for scheduled Dreaming. Review generated memories.
 
 See [camelRun's Dreaming guide](https://github.com/qaml-ai/run/blob/5843358775cc9e8dcda45edb6920873a8c3489b2/docs/guides/dreaming.md).
+
+## Lead tool authentication
+
+The lead's tools are MCP tools at `/agent/:project/mcp`, configured as:
+
+```json
+{
+  "name": "delivery",
+  "url": "https://lead.example.com/agent/demo/mcp",
+  "auth": { "type": "runtime" },
+  "allowTools": ["send_message", "participants"]
+}
+```
+
+camelRun signs a short-lived Ed25519/EdDSA JWT for **each** MCP request using its
+private key. This service uses the existing `@camelai/run/server`
+`verifyRuntimeToken` helper and the runtime's published `/.well-known/jwks.json`.
+It checks the signature, expiry/times, issuer, tenant, the exact configured
+endpoint audience, the exact lead agent id, and its signed `context.project`.
+Only the lead itself is accepted, not arbitrary agents or other tenants' agents.
+The private signing key stays in camelRun. No shared lead token, custom keypair,
+OpenAPI delivery source, or client OAuth is involved. The old `/agent/:project/send`
+and `/agent/:project/participants` REST routes are removed.
+
+`CAMELRUN_URL` locates the trusted keys; `CAMELRUN_ISSUER` can explicitly select
+an issuer when the deployment uses an alias (the SDK knows the hosted runtime's
+standard aliases). `CAMEL_LEAD_URL` is trusted configuration, not a caller-supplied
+Host header. If the adapter origin changes, update it and reactivate the MCP
+source. Existing client-facing bearer auth remains unchanged.
+
+Projects created by the earlier prototype must have `tenantId` and an agent with
+immutable `context.project`; do not silently reuse an agent missing those claims.
+This is tool identity verification, not user account OAuth or sign-in.
 
 ## Connect a client
 

@@ -2,7 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { LeadClient, deliverPending } from "../clients/api.ts";
 import { deliverCodex, deliverOpenCode } from "../clients/bridges.ts";
-import { leadDefinition, memoryConfig } from "../scripts/plan.ts";
+import {
+  leadDefinition,
+  leadMcpSource,
+  memoryConfig,
+} from "../scripts/plan.ts";
 const event = {
   seq: 7,
   id: "event-7",
@@ -107,17 +111,13 @@ test("OpenCode bridge uses the inspected API, carries source identity and refuse
 test("memory and delivery provisioning use the current camelRun APIs", () => {
   assert.throws(() => memoryConfig("v", 0), /explicit/);
   assert.deepEqual(memoryConfig("v", 1).acrossUsers, true);
-  const d = leadDefinition("demo", "https://lead.test", "synthetic-only");
-  assert.equal(d.openApi[0].auth.token, "synthetic-only");
-  assert.equal(
-    d.openApi[0].spec.paths["/agent/demo/send"]?.post.operationId,
-    "send_message",
-  );
+  const d = leadDefinition("demo");
+  const source = leadMcpSource("demo", "https://lead.test");
+  assert.deepEqual(source.auth, { type: "runtime" });
+  assert.equal(source.url, "https://lead.test/agent/demo/mcp");
+  assert.equal("openApi" in d, false);
   assert.match(d.systemPrompt, /shared/);
-  assert.throws(
-    () => leadDefinition("../bad", "https://lead.test", "x"),
-    /Invalid project/,
-  );
+  assert.throws(() => leadDefinition("../bad"), /Invalid project/);
 });
 
 test(
@@ -217,7 +217,7 @@ test(
     const server = createServer(async (req, res) => {
       let text = "";
       for await (const chunk of req) text += chunk;
-      calls.push({ path: req.url!, body: JSON.parse(text) });
+      calls.push({ path: req.url!, body: text ? JSON.parse(text) : null });
       const id =
         req.url === "/v1/definitions"
           ? "def_test"
@@ -225,7 +225,9 @@ test(
             ? "vol_test"
             : "client_" + "a".repeat(40);
       res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ id }));
+      res.end(
+        JSON.stringify(req.url === "/v1/me" ? { tenant: "test" } : { id }),
+      );
     });
     await new Promise<void>((resolve) =>
       server.listen(0, "127.0.0.1", resolve),
@@ -267,7 +269,7 @@ test(
     assert.deepEqual(
       calls.map((c) => c.path),
       [
-        "/v1/definitions",
+        "/v1/me",
         "/v1/volumes",
         "/v1/agents",
         "/v1/agents/" + "client_" + "a".repeat(40) + "/dreaming",
@@ -277,10 +279,19 @@ test(
       { volumeId: "vol_test", path: "/memory", mode: "ro" },
     ]);
     assert.equal(calls[3].body.acrossUsers, true);
+    assert.equal(calls[2].body.context.project, "demo");
+    assert.equal("definition" in calls[2].body, false);
     const config = JSON.parse(
       await readFile(join(dir, ".secrets/demo/projects.json"), "utf8"),
     );
     assert.deepEqual(Object.keys(config.demo.clients), ["alice", "bob"]);
+    assert.equal(config.demo.tenantId, "test");
+    assert.equal("leadTokenHash" in config.demo, false);
+    const activation = JSON.parse(
+      await readFile(join(dir, ".secrets/demo/activation.json"), "utf8"),
+    );
+    assert.deepEqual(activation.source.auth, { type: "runtime" });
+    assert.equal(activation.source.url, "https://lead.test/agent/demo/mcp");
     const raw = await readFile(join(dir, ".secrets/demo/alice.token"), "utf8");
     assert.equal(output.includes(raw), false);
     assert.equal(
@@ -289,3 +300,88 @@ test(
     );
   },
 );
+
+for (const tenantMatches of [true, false])
+  test(
+    `MCP activation ${tenantMatches ? "uses runtime identity auth" : "refuses another tenant"} without a shared lead secret`,
+    { timeout: 10000 },
+    async (t) => {
+      const { createServer } = await import("node:http");
+      const { mkdtemp, rm, mkdir, writeFile } =
+        await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const { spawn } = await import("node:child_process");
+      const dir = await mkdtemp(join(tmpdir(), "lead-activation-"));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      await mkdir(join(dir, ".secrets/demo"), { recursive: true });
+      await writeFile(
+        join(dir, ".secrets/demo/activation.json"),
+        JSON.stringify({
+          agentId: "client_test",
+          tenantId: "test",
+          source: { url: "https://lead.test/agent/demo/mcp" },
+        }),
+      );
+      const calls: { method: string; path: string; body: any }[] = [];
+      const server = createServer(async (req, res) => {
+        let body = "";
+        for await (const chunk of req) body += chunk;
+        calls.push({
+          method: req.method!,
+          path: req.url!,
+          body: body ? JSON.parse(body) : null,
+        });
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify(
+            req.url === "/v1/me"
+              ? { tenant: tenantMatches ? "test" : "other" }
+              : req.method === "PATCH"
+                ? { id: "configured" }
+                : {
+                    state: "completed",
+                    outcome: { result: { configured: true } },
+                  },
+          ),
+        );
+      });
+      await new Promise<void>((resolve) =>
+        server.listen(0, "127.0.0.1", resolve),
+      );
+      t.after(() => {
+        server.closeAllConnections();
+        server.close();
+      });
+      const child = spawn(
+        process.execPath,
+        [
+          "--experimental-strip-types",
+          new URL("../scripts/activate.ts", import.meta.url).pathname,
+          "demo",
+        ],
+        {
+          cwd: dir,
+          env: {
+            PATH: process.env.PATH || "",
+            CAMELAI_API_KEY: "synthetic-only",
+            CAMELAI_BASE_URL: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      child.stdout.resume();
+      child.stderr.resume();
+      const code = await new Promise<number | null>((resolve) =>
+        child.on("exit", resolve),
+      );
+      assert.equal(code, tenantMatches ? 0 : 1);
+      if (tenantMatches) {
+        assert.deepEqual(calls[1].body.mcpServers, [
+          leadMcpSource("demo", "https://lead.test"),
+        ]);
+        assert.equal(calls[1].method, "PATCH");
+        assert.equal(calls.length, 3);
+      } else assert.equal(calls.length, 1);
+    },
+  );

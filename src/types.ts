@@ -1,11 +1,12 @@
 import { timingSafeEqual } from "node:crypto";
+import { verifyRuntimeToken } from "@camelai/run/server";
 export interface ClientConfig {
   name: string;
   tokenHash: string;
 }
 export interface ProjectConfig {
   agentId: string;
-  leadTokenHash: string;
+  tenantId: string;
   clients: Record<string, ClientConfig>;
 }
 export type Message = {
@@ -29,6 +30,7 @@ export interface Secrets {
   CAMELRUN_API_KEY: string;
   PROJECTS_JSON: string;
   RUNTIME?: Fetcher;
+  CAMELRUN_ISSUER?: string;
 }
 export type WorkerEnv = Env & Secrets;
 export class Failure extends Error {
@@ -98,11 +100,38 @@ export async function clientAuth(request: Request, p: ProjectConfig) {
     if (await matches(token, client.tokenHash)) return id;
   throw new Failure(401, "Invalid client credential");
 }
-export async function leadAuth(request: Request, p: ProjectConfig) {
-  const token =
-    request.headers.get("authorization")?.replace(/^Bearer /, "") || "";
-  if (!token || !(await matches(token, p.leadTokenHash)))
-    throw new Failure(401, "Invalid lead credential");
+/** camelRun signs each request; the adapter stores no lead private/shared key. */
+export async function leadAuth(
+  request: Request,
+  p: ProjectConfig,
+  env: WorkerEnv,
+  project: string,
+) {
+  const token = /^Bearer\s+(\S+)$/i.exec(
+    request.headers.get("authorization") || "",
+  )?.[1];
+  if (!token || !p.tenantId)
+    throw new Failure(401, "Runtime identity required");
+  try {
+    const audience = `${env.CAMEL_LEAD_URL.replace(/\/+$/, "")}/agent/${project}/mcp`;
+    const identity = await verifyRuntimeToken(token, {
+      runtime: env.CAMELRUN_URL,
+      tenant: p.tenantId,
+      audience,
+      ...(env.CAMELRUN_ISSUER ? { issuer: env.CAMELRUN_ISSUER } : {}),
+      ...(env.RUNTIME
+        ? {
+            fetch: (input: RequestInfo | URL, init?: RequestInit) =>
+              env.RUNTIME!.fetch(new Request(input, init)),
+          }
+        : {}),
+    });
+    if (identity.agent !== p.agentId || identity.context.project !== project)
+      throw new Error("Not this project's lead");
+    return identity;
+  } catch {
+    throw new Failure(401, "Invalid runtime identity");
+  }
 }
 
 export async function rpc(

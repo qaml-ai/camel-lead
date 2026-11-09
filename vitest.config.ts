@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const project = {
   agentId: "client_" + "a".repeat(40),
-  leadTokenHash: hash("lead-test-only"),
+  tenantId: "test",
   clients: {
     alice: { name: "Alice", tokenHash: hash("alice-test-only") },
     bob: { name: "Bob", tokenHash: hash("bob-test-only") },
@@ -17,6 +17,7 @@ export default defineConfig({
       miniflare: {
         bindings: {
           CAMELRUN_API_KEY: "runtime-test-only",
+          CAMEL_LEAD_URL: "https://lead.test",
           PROJECTS_JSON: JSON.stringify({ demo: project, other: project }),
         },
       },

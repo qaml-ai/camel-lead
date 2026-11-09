@@ -6,7 +6,10 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": false,
   "preview_urls": false,
-  "vars": { "CAMELRUN_URL": "https://run-pilot.camelai.dev" },
+  "vars": {
+    "CAMELRUN_URL": "https://run-pilot.camelai.dev",
+    "CAMEL_LEAD_URL": "https://camel-lead.miguel-85b.workers.dev",
+  },
   "observability": {
     "enabled": true,
     "logs": { "enabled": true, "invocation_logs": false },

@@ -8,16 +8,11 @@ import {
   leadAuth,
   type WorkerEnv,
 } from "./types.ts";
-import { mcp } from "./mcp.ts";
+import { mcp, leadMcp } from "./mcp.ts";
 export { ProjectRoom } from "./room.ts";
 const message = z.object({
   text: z.string().min(1).max(16_000),
   requestId: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
-});
-const outgoing = z.object({
-  target: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
-  text: z.string().min(1).max(16_000),
-  messageId: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
 });
 export default {
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
@@ -33,23 +28,16 @@ export default {
         p = config(env, project),
         room = env.PROJECTS.getByName(project);
       if (kind === "agent") {
-        await leadAuth(request, p);
-        if (action === "send" && request.method === "POST") {
-          const body = outgoing.parse(await boundedJson(request));
-          return Response.json(
-            await rpc(
-              room,
-              "send",
-              project,
-              body.target,
-              body.text,
-              body.messageId,
-            ),
-          );
-        }
-        if (action === "participants" && request.method === "GET")
-          return Response.json(await rpc(room, "participants", project));
-        throw new Failure(404, "Not found");
+        if (action !== "mcp") throw new Failure(404, "Not found");
+        await leadAuth(request, p, env, project);
+        if (request.method !== "POST")
+          throw new Failure(405, "Stateless MCP: POST each request");
+        return await leadMcp(
+          request,
+          await boundedJson(request),
+          room,
+          project,
+        );
       }
       const client = await clientAuth(request, p);
       if (action === "mcp") {

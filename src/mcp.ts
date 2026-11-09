@@ -77,6 +77,90 @@ export async function mcp(
     },
     safe(async () => rpc(room, "participants", project)),
   );
+  return transportResponse(request, body, server);
+}
+
+/** Only runtime-verified lead requests reach this endpoint, and its project is not a model argument. */
+export async function leadMcp(
+  request: Request,
+  body: any,
+  room: DurableObjectStub<ProjectRoom>,
+  project: string,
+) {
+  const server = new McpServer(
+    { name: "camel-lead-delivery", version: "0.2.0" },
+    {
+      instructions:
+        "Send messages only to authorized project collaborators. Queued delivery does not confirm client processing.",
+    },
+  );
+  server.registerTool(
+    "send_message",
+    {
+      description:
+        "Queue a message to one authorized project client, or target all. Use a stable messageId for retries.",
+      inputSchema: {
+        target: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
+        text: z.string().min(1).max(16_000),
+        messageId: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
+      },
+    },
+    async (args) => {
+      try {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                await rpc(
+                  room,
+                  "send",
+                  project,
+                  args.target,
+                  args.text,
+                  args.messageId,
+                ),
+              ),
+            },
+          ],
+        };
+      } catch {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: "Message refused; check recipient and messageId. Retry identical content with the same messageId.",
+            },
+          ],
+        };
+      }
+    },
+  );
+  server.registerTool(
+    "participants",
+    {
+      description:
+        "List authorized project clients and their last adapter contact time.",
+      inputSchema: {},
+    },
+    async () => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await rpc(room, "participants", project)),
+        },
+      ],
+    }),
+  );
+  return transportResponse(request, body, server);
+}
+
+async function transportResponse(
+  request: Request,
+  body: any,
+  server: McpServer,
+) {
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
