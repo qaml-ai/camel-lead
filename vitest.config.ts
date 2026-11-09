@@ -27,5 +27,5 @@ export default defineConfig({
       },
     }),
   ],
-  test: { include: ["test/worker.spec.ts", "test/oauth.spec.ts", "test/cimd.spec.ts", "test/enrollment.spec.ts"], fileParallelism: false },
+  test: { include: ["test/worker.spec.ts", "test/wait.spec.ts", "test/oauth.spec.ts", "test/cimd.spec.ts", "test/enrollment.spec.ts"], fileParallelism: false },
 });

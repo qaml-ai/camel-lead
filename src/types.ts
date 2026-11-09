@@ -153,3 +153,19 @@ export async function rpc(
   if (!reply.ok) throw new Failure(reply.status, reply.error);
   return reply.value;
 }
+/** A wait lost to an evicted or restarted room degrades to a plain read; the mailbox is durable. */
+export async function waitRead(
+  room: { invoke(operation: string, args: unknown[]): Promise<any> },
+  project: string,
+  client: string,
+  seconds: number,
+  after: number,
+) {
+  if (!(seconds > 0)) return rpc(room, "read", project, client, after);
+  try {
+    return await rpc(room, "wait", project, client, seconds, after);
+  } catch (error) {
+    if (error instanceof Failure) throw error;
+    return rpc(room, "read", project, client, after);
+  }
+}

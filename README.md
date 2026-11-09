@@ -11,12 +11,21 @@ participants()                         # authorized clients and last adapter con
 send_message(target, text, messageId)   # one client, or target="all"
 ```
 
-Clients use `message`, `get_messages`, `acknowledge`, and `participants`. Multiple
-clients can submit simultaneously to **one shared agent and conversation**.
-camelRun serializes their turns. A normal final reply goes back to its caller;
-the lead can also proactively message any authorized client. Durable SQLite
-mailboxes preserve messages when a client disconnects. No VM or permanent socket
-is needed for the adapter.
+Clients use `message`, `wait_for_messages`, `get_messages`, `acknowledge`, and
+`participants`. Multiple clients can submit simultaneously to **one shared agent
+and conversation**. camelRun serializes their turns. A normal final reply goes
+back to its caller; the lead can also proactively message any authorized client.
+Durable SQLite mailboxes preserve messages when a client disconnects. No VM,
+helper process or permanent socket is needed.
+
+Nothing is pushed into a coding client. A client **waits** for its mail, in one of
+three standard ways that all read the same durable mailbox:
+
+| Way                          | Use it when                                                    | Cost while waiting                   |
+| ---------------------------- | -------------------------------------------------------------- | ------------------------------------ |
+| `wait_for_messages` MCP tool | Any MCP client; no helper process                              | One held tool call, up to 50 s each  |
+| `clients/wait.ts` CLI        | The agent can run a background shell command                   | No model tokens; server can sleep    |
+| WebSocket `/projects/:p/ws`  | Your own long-lived process                                    | Server hibernates while idle         |
 
 ## Status
 
@@ -25,16 +34,17 @@ Implemented and locally tested in real workerd, with synthetic camelRun response
 This is an operator-configured, trusted project/team adapter, not a public signup
 service. A public source repository does not mean anonymous access to projects.
 
-| Client                   | Conversation                                 | Incoming push                                                      |
-| ------------------------ | -------------------------------------------- | ------------------------------------------------------------------ |
-| Claude Code              | Remote MCP or included stdio adapter         | Claude channel extension, explicitly opted in                      |
-| Codex                    | Remote MCP or generic stdio                  | Included app-server bridge; **not** a native MCP notification      |
-| OpenCode                 | Remote MCP or generic stdio                  | Included HTTP bridge against the inspected current development API |
-| Cursor/other MCP clients | Remote MCP tools                             | Poll `get_messages`; no unsolicited turns promised                 |
-| ChatGPT                  | MCP client capable of configured bearer auth | No automatic hosted connector registration or wake-up support      |
+| Client                   | Conversation                                 | Getting updates from the lead                                 |
+| ------------------------ | -------------------------------------------- | ------------------------------------------------------------- |
+| Claude Code              | Remote MCP or included stdio adapter         | `wait_for_messages`, or the wait CLI as a background command  |
+| Codex                    | Remote MCP or included stdio adapter         | `wait_for_messages`, or the wait CLI                          |
+| OpenCode                 | Remote MCP or included stdio adapter         | `wait_for_messages`, or the wait CLI                          |
+| Cursor/other MCP clients | Remote MCP tools                             | `wait_for_messages`                                           |
+| ChatGPT                  | MCP client capable of configured bearer auth | `wait_for_messages`; no hosted connector registration         |
 
-A local helper must be running for native-client delivery. The shared lead itself
-remains hosted. Ordinary MCP tool access alone does not wake a coding client.
+The earlier push paths (Claude development channel, Codex app-server bridge,
+OpenCode HTTP bridge) are removed. A client learns of new mail only while it is
+waiting or when it next reads; nothing starts a turn in an idle client.
 
 ## Setup (operator)
 
@@ -155,58 +165,72 @@ This is tool identity verification, not user account OAuth or sign-in.
 Set `CAMEL_LEAD_URL` to your adapter URL and `CAMEL_LEAD_TOKEN` privately to that
 client's credential. These credentials are different from your camelRun API key.
 
-Remote MCP: `https://lead.example.com/projects/demo/mcp`, with bearer auth.
-The server is stateless HTTP; use the client tools to poll messages. OAuth/DCR
-and an app-store connector are not implemented.
+Remote MCP: `https://lead.example.com/projects/demo/mcp`, with bearer auth or
+[GitHub sign-in](docs/github-auth.md). The server is stateless HTTP.
 
-Generic local MCP (Codex, OpenCode, Cursor, etc.):
+Local MCP, for clients that need a stdio server (bearer credential only):
 
 ```sh
-node --experimental-strip-types clients/stdio.ts demo generic
+node --experimental-strip-types clients/stdio.ts demo
+# Claude Code, for example:
+claude mcp add project-lead -- node --experimental-strip-types /absolute/path/camel-lead/clients/stdio.ts demo
 ```
 
 Register that command using the client's normal MCP configuration. Do not commit
 credential values; pass them through its supported environment mechanism.
 
-Claude Code channel:
+### Wait for the lead
+
+**In any MCP client:** call `wait_for_messages({ timeoutSeconds?, after? })`. It
+returns as soon as mail exists, otherwise holds the call until mail arrives or
+the timeout ends (1 to 50 seconds, default 25). An empty result has
+`status: "no_new_messages"`; call it again to keep waiting. Pass the returned
+`next` as `after` to skip what you have already seen, or `acknowledge` what you
+have handled. The 50-second ceiling stays under the 60-second request limit that
+common MCP clients apply to one tool call; raise the client's own tool timeout
+if it is lower than the wait you ask for.
+
+**From a shell, with no tokens spent while waiting:**
 
 ```sh
-claude mcp add project-lead -- node --experimental-strip-types /absolute/path/camel-lead/clients/stdio.ts demo claude
-claude --dangerously-load-development-channels server:project-lead
+node --experimental-strip-types clients/wait.ts demo [--timeout SECONDS] [--after SEQ] [--ack] [--poll]
 ```
 
-Claude's development-channel preview needs explicit opt-in and may be blocked by
-organization policy. The adapter emits `notifications/claude/channel`. A successful
-transport write is **not** confirmation that Claude processed the message. Its
-mailbox acknowledgement is transport-level; select generic polling if you need
-the user/model to explicitly acknowledge processing.
+It blocks until at least one message arrives, prints each as one JSON line
+(`seq`, `id`, `kind`, `requestId`, and `text` framed as external data), and exits
+`0`. With `--timeout` it exits `2` if nothing arrived; errors exit `1`. `--ack`
+acknowledges what it printed, after printing; without it, acknowledge through
+the MCP tool or pass `--after` next time. It sleeps on the WebSocket and falls
+back to chained 50-second long-polls (`--poll` forces that) when a socket cannot
+be opened.
 
-Codex incoming-event bridge (run alongside its generic MCP tools):
+The pattern for a coding agent: start the command in the background, carry on or
+stop, and treat its exit as the wake-up.
 
-```sh
-node --experimental-strip-types clients/bridge.ts demo codex LOCAL_THREAD_ID
-```
+- **Claude Code:** run it with the Bash tool's `run_in_background`. Claude is
+  notified when the command exits and reads the printed messages then. To keep
+  listening, start it again after handling them.
+- **Any other agent that can run a shell command:** run it in the background or
+  as a blocking command with `--timeout` under the client's command limit, and
+  loop on exit code `2`.
 
-This starts an app-server, resumes a local thread, submits events with `turn/start`,
-and acknowledges only completed turns. It does not add native Codex MCP-channel
-support, create cloud sessions or bypass thread ownership. Keep its credentials,
-permissions and normal app-server configuration intact. It stops on unsupported
-approval requests; it **never auto-approves**. A cloud test accepted protocol calls
-but inference failed with HTTP CONNECT 403, so a real Codex model response remains
-unverified.
+**From your own process:** `GET /projects/:project/ws[?after=SEQ]` with the same
+credential upgrades to a WebSocket. The server sends
+`{"type":"messages","events":[...],"next":SEQ}` once on connect if mail is pending
+and again whenever mail arrives; each socket gets an event once. Send
+`{"type":"ack","seq":SEQ}` to acknowledge (answered with `{"type":"ack","ack":SEQ}`
+or `{"type":"error",...}`). Send the text `ping` for a `pong` keepalive; the
+runtime answers it without waking the hibernating Durable Object. A socket
+closed with code `4401`, or one sent `{"type":"reauthenticate"}`, must be
+replaced by a newly authenticated request: this happens when a bearer credential
+is rotated or removed, and for GitHub-authenticated sockets whenever mail arrives
+more than a minute after connecting, because GitHub membership is rechecked on
+every request and a socket cannot do that. Code `4008` means a newer connection
+replaced this one.
 
-OpenCode incoming-event bridge:
-
-```sh
-# Optional: OPENCODE_BASE_URL, OPENCODE_AUTHORIZATION (private server auth header)
-node --experimental-strip-types clients/bridge.ts demo opencode SESSION_ID
-```
-
-Targets `POST /api/session/:sessionID/prompt` from development revision
-[`7a2e04b`](https://github.com/anomalyco/opencode/blob/7a2e04b37d6aa178af207ce52a6111c747f2855f/packages/protocol/src/groups/session.ts).
-It acknowledges after durable API admission, **not** model completion. Older
-versions use different APIs; it fails rather than silently guessing routes.
-Actual OpenCode execution is unverified.
+The plain HTTP form is `GET /projects/:project/messages?wait=SECONDS&after=SEQ`
+(`wait` 0 to 50, larger values are clamped; default 0 answers at once). It
+returns `{ "events": [...], "next": SEQ }`; an empty `events` means nothing yet.
 
 ## Delivery and safety
 
@@ -218,13 +242,20 @@ Actual OpenCode execution is unverified.
 - Mailbox messages remain until explicitly acknowledged. Acknowledgement hides
   them from subsequent reads; it does not delete stored records.
 - Delivery is at-least-once: a client crash after processing but before ack can
-  repeat an event. Codex/OpenCode consumers must make side effects idempotent.
+  repeat an event. Consumers must make side effects idempotent. Waiting, a
+  WebSocket frame and the wait CLI without `--ack` never acknowledge anything.
+- Waiting requests live in memory; mail does not. If the Durable Object restarts,
+  a held request returns empty or fails, the client asks again, and the mailbox
+  answers. Hibernated WebSockets survive with their delivery cursor.
+- Each client may hold 4 waiting requests and 4 sockets; a fifth replaces the
+  oldest, so an abandoned wait cannot lock a client out. Each project is capped at
+  256 waiting requests and 1024 sockets (HTTP 429 beyond that).
 - Normal lead replies and proactive tool messages are separate. The lead is
   instructed not to send duplicate final replies or endless agent-to-agent loops.
 - External messages are not trusted instructions or approvals. Do not automatically
   execute dangerous actions just because another agent requested them.
 - There is a 100-pending-request project queue, bounded message bodies, 16k-character
-  messages, and no arbitrary webhook target URLs. Polling is authenticated.
+  messages, and no arbitrary webhook target URLs. Reading and waiting are authenticated.
 - Twelve delivery errors, invalid upstream authorization or missing upstream
   resources mark the local request failed and notify its caller. The upstream
   request may still have executed; inspect its ID before manually replaying.
@@ -239,12 +270,10 @@ The `healthz` route is public; all project/lead operations require credentials.
 
 `npm test` runs actual Workers/Durable Objects tests: authorization, concurrent
 clients, idempotency, private routing, broadcast, eviction persistence, outbox
-retries, live MCP wire contracts, and bounds. `npm run test:node` checks adapters
-and provisioning contracts with fixtures. These are not claims of live provider
-interoperability.
-
-Claude reference: https://code.claude.com/docs/en/channels-reference
-Codex restriction: https://github.com/openai/codex/blob/6222faa3c463442b3788b2690108568786f6ffc7/codex-rs/app-server/src/request_processors/mcp_event_stream.rs
+retries, live MCP wire contracts, blocking reads, hibernating WebSockets and
+bounds. `npm run test:node` checks the stdio adapter, the wait CLI's exit codes
+against a synthetic server, and provisioning contracts. These are not claims of
+live provider interoperability.
 
 CI checks every push/PR. There is deliberately **no automatic deployment workflow**.
 
