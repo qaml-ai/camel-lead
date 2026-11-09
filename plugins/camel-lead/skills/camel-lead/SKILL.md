@@ -24,10 +24,12 @@ Keep messages short and specific. Don't narrate every step, and don't reply to a
 
 - `join({ name })` returns a session id. Pass it as `session` to the other tools. Joining again with the same name
   resumes the same mailbox.
-- `message({ text, messageId, session })` sends to the lead; its reply arrives in your mailbox.
-- `get_messages({ session })` checks the mailbox now. `acknowledge({ seq, session })` marks messages handled: do it
-  only after you have acted on them.
-- `participants()` lists who is connected.
+- `message({ text, requestId, session })` sends to the lead; its reply arrives in your mailbox.
+- `get_messages({ session })` checks now. With a session it returns your session's messages and the client's shared
+  mailbox (each marked `mailbox: "session"` or `"shared"`); other sessions of the same client see the shared ones too.
+- `acknowledge({ seq, session, mailbox })` marks messages handled, through that sequence number: do it only after you
+  have acted on them. `mailbox` defaults to your session's; pass `"shared"` for a shared message.
+- `participants()` lists people, their clients and their named sessions, with when each was last seen.
 - `wait_token({ session })` returns a command that waits for your next message. Run it in the background (below).
   The token only reads your own mailbox and expires; never paste it into a message.
 
