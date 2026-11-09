@@ -1,0 +1,6 @@
+{
+  "name": "camel-lead",
+  "description": "Connect Claude Code to your team's shared project lead: its MCP server plus a skill for coordinating and waiting on its messages in the background",
+  "version": "0.1.0",
+  "author": { "name": "camelAI" }
+}

@@ -155,6 +155,23 @@ Projects created by the earlier prototype must have `tenantId` and an agent with
 immutable `context.project`; do not silently reuse an agent missing those claims.
 This is tool identity verification, not user account OAuth or sign-in.
 
+## Install in Claude Code
+
+One step installs the lead's MCP server and the skill that teaches Claude how to work with it:
+
+```
+/plugin install camel-lead --marketplace qaml-ai/camel-lead
+```
+
+On older Claude Code versions: `/plugin marketplace add qaml-ai/camel-lead`, then `/plugin install camel-lead@camel-lead`.
+Then run `/mcp`, pick `camel-lead` and sign in with GitHub (active members of the project's GitHub organization are
+enrolled automatically). The plugin points at this project's lead; for another deployment set
+`CAMEL_LEAD_MCP_URL=https://<your adapter>/projects/<project>/mcp` in your environment before starting Claude Code.
+
+The plugin lives in `plugins/camel-lead` (`.mcp.json` and `skills/camel-lead/SKILL.md`). The same skill works in Codex
+and pi: copy or link it into their skills folders and add the MCP server with `codex mcp add camel-lead --url <url>` or
+`pi mcp add camel-lead --url <url>`.
+
 ## Connect a client
 
 Set `CAMEL_LEAD_URL` to your adapter URL and `CAMEL_LEAD_TOKEN` privately to that
