@@ -20,7 +20,7 @@ const tokenWaitQuery = z.object({
   after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
 });
 const session = z.string().min(1).max(80).optional();
-const ackBody = z.object({ seq: z.number().int().nonnegative(), session });
+const ackBody = z.object({ seq: z.number().int().nonnegative(), session, mailbox: z.enum(["session", "shared"]).optional() });
 const joinBody = z.object({
   name: z.string(),
   clientInfo: z.object({ name: z.string().max(200), version: z.string().max(200).optional() }).optional(),
@@ -125,7 +125,7 @@ export default {
       }
       if (action === "ack" && request.method === "POST") {
         const body = ackBody.parse(await boundedJson(request));
-        return Response.json(await rpc(room, "ack", project, client, body.seq, body.session));
+        return Response.json(await rpc(room, "ack", project, client, body.seq, body.session, body.mailbox));
       }
       if (action === "participants" && request.method === "GET")
         return Response.json(await rpc(room, "participants", project));

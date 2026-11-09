@@ -76,7 +76,11 @@ server.registerTool(
   "acknowledge",
   {
     description: TOOL_TEXT.acknowledge,
-    inputSchema: { seq: z.number().int().nonnegative(), session },
+    inputSchema: {
+      seq: z.number().int().nonnegative(),
+      session,
+      mailbox: z.enum(["session", "shared"]).optional().describe(TOOL_TEXT.mailbox),
+    },
   },
   async (args) => result(await client.call("ack", args)),
 );

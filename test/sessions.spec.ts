@@ -10,9 +10,9 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 import { testRuntime } from "@camelai/run/testing";
 import worker from "../src/worker.ts";
 import { hash, rpc, type WorkerEnv } from "../src/types.ts";
-import { clientLabel, displayName, sessionName } from "../src/names.ts";
+import { clientLabel, displayName, plain, sessionName } from "../src/names.ts";
 import { automaticMailboxId } from "../src/enrollment.ts";
-import { MAX_SESSIONS, type ProjectRoom } from "../src/room.ts";
+import { MAX_SESSIONS, SESSION_LIVE_MS, type ProjectRoom } from "../src/room.ts";
 
 const ALICE = "alice-test-only",
   BOB = "bob-test-only",
@@ -50,6 +50,9 @@ const send = async (target: string, text: string, project = "demo") =>
   (await rpc(room(project), "send", project, target, text, `m${++sent}`)).deliveredToMailboxes as string[];
 const texts = (mail: any) => mail.events.map((e: any) => e.text);
 const mailbox = async (session?: string, token = ALICE) => texts(await tool("get_messages", session ? { session } : {}, token));
+/** What a session sees, as [mailbox marker, text]. */
+const marked = async (session: string, token = ALICE) =>
+  (await tool("get_messages", { session }, token)).events.map((e: any) => [e.mailbox, e.text]);
 const sql = <T = any>(query: string, ...args: unknown[]) =>
   runInDurableObject(room(), (_o: ProjectRoom, s) => s.storage.sql.exec(query, ...args).toArray() as T[]);
 /** Make a session look unseen for `ms`. */
@@ -95,6 +98,14 @@ describe("readable names", () => {
       [42, "agent"],
     ] as const)
       expect(clientLabel(raw)).toBe(label);
+    // No part of a display name can carry its separators, so one participant cannot read as another.
+    expect(clientLabel("Miguel's Codex · chiridion")).toBe("Miguels Codex - chiridion");
+    expect(clientLabel("evil's")).toBe("evils");
+    expect(clientLabel("·")).toBe("-");
+    expect(sessionName("Miguel's Claude Code · main")).toBe("Miguels Claude Code - main");
+    expect(sessionName("it’s  ·  done")).toBe("its - done");
+    expect(sessionName("boss’s notes")).toBe("bosss notes");
+    expect(plain("O'Shea's")).toBe("O'Sheas");
     expect(displayName("Miguel", "Claude Code")).toBe("Miguel's Claude Code");
     expect(displayName("Miguel", "Claude Code", "chiridion-2")).toBe("Miguel's Claude Code · chiridion-2");
   });
@@ -141,8 +152,32 @@ describe("readable names", () => {
     ]);
     // A tool argument can name the session, never the person.
     const joined = await rpc(room("auto"), "joinSession", "auto", old, "Isabella's Codex");
-    expect(joined.displayName).toBe("Miguel's Claude Code · Isabella's Codex");
+    expect(joined.displayName).toBe("Miguel's Claude Code · Isabellas Codex");
     await expect(rpc(room("auto"), "recordClientInfo", "auto", "gh_unknown", "x")).rejects.toMatchObject({ status: 403 });
+  });
+  it("carries the GitHub login, and uses it to tell apart two people with the same name", async () => {
+    const r = room("auto");
+    const one = await rpc(r, "resolveOAuthClient", "auto", "1033072", "client-a", true, { login: "msalinas", name: "Miguel" });
+    await rpc(r, "resolveOAuthClient", "auto", "999", "client-a", true, { login: "isa", name: "Isabella's · Team" });
+    let people = await participants("auto");
+    expect(people.map((p) => [p.name, p.login, p.clients[0].displayName])).toEqual([
+      ["Miguel", "msalinas", "Miguel's agent"],
+      ["Isabellas - Team", "isa", "Isabellas - Team's agent"],
+    ]);
+    // A second Miguel: both are shown with their login, in clients, sessions and what the lead is told.
+    const two = await rpc(r, "resolveOAuthClient", "auto", "555", "client-a", true, { login: "miguel-b", name: "miguel" });
+    await rpc(r, "recordClientInfo", "auto", one, "claude-code");
+    const joined = await rpc(r, "joinSession", "auto", one, "chiridion-2");
+    expect(joined.displayName).toBe("Miguel (@msalinas)'s Claude Code · chiridion-2");
+    people = await participants("auto");
+    expect(people.map((p) => [p.name, p.login])).toEqual([["Miguel", "msalinas"], ["Isabellas - Team", "isa"], ["miguel", "miguel-b"]]);
+    expect(people[0].clients[0].displayName).toBe("Miguel (@msalinas)'s Claude Code");
+    expect(people[0].clients[0].sessions[0].displayName).toBe("Miguel (@msalinas)'s Claude Code · chiridion-2");
+    expect(people[2].clients[0]).toMatchObject({ id: two, displayName: "miguel (@miguel-b)'s agent" });
+    await rpc(r, "submit", "auto", one, "r1", "hello", joined.session);
+    expect((await runTurn("ok", "auto")).from).toEqual({ id: joined.session, name: "Miguel (@msalinas)'s Claude Code · chiridion-2" });
+    // Static bearer clients have no login and are unchanged.
+    expect((await participants())[0]).toEqual({ name: "Alice", clients: [expect.objectContaining({ displayName: "Alice's agent" })] });
   });
   it("stores the GitHub login and name at OAuth sign-in and backfills them on later requests", async () => {
     const e: WorkerEnv = { ...env, GITHUB_CLIENT_ID: "test-github-client", GITHUB_CLIENT_SECRET: "test-github-secret" };
@@ -233,7 +268,18 @@ describe("join", () => {
     expect(await sql("SELECT count(*) AS n FROM sessions WHERE client='alice'")).toEqual([{ n: MAX_SESSIONS }]);
     expect((await mcpCall("get_messages", { session: ids[7] })).isError).toBe(true);
     expect(await mailbox()).toEqual(["unread in an idle session"]);
-    expect(await mailbox(fresh)).toEqual([]);
+    expect(await marked(fresh)).toEqual([["shared", "unread in an idle session"]]);
+    // A session with a wait parked right now is never the one that gives way.
+    const oldest = (await sql("SELECT id FROM sessions WHERE client='alice' ORDER BY seen LIMIT 1"))[0].id as string;
+    await tool("acknowledge", { seq: (await tool("get_messages", {})).next });
+    const parked = waitFor((await tool("wait_token", { session: oldest })).token, "?timeout=30");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await sql("UPDATE sessions SET seen=? WHERE client='alice'", Date.now() - 2 * DAY);
+    await sql("UPDATE sessions SET seen=seen-1000 WHERE id=?", oldest);
+    await join("needs-room-again");
+    expect(await sql("SELECT count(*) AS n FROM sessions WHERE client='alice'")).toEqual([{ n: MAX_SESSIONS }]);
+    await send(oldest, "done waiting");
+    expect(await parked).toEqual(["done waiting"]);
   });
   it("expires a session unseen for 7 days and moves its unacknowledged messages to the client mailbox", async () => {
     const s = await join("old-task");
@@ -260,9 +306,14 @@ describe("join", () => {
     expect((await req(`messages?session=${s}`)).status).toBe(404);
     expect(await waitFor(token)).toBe(401);
     expect((await room().invoke("send", ["demo", s, "late", "late"])).status).toBe(404);
-    // Joining again by name starts the same id afresh: nothing is delivered twice.
+    // Nothing of the ended session is kept: not its acknowledged messages, its receipt or its tokens.
+    expect(await sql("SELECT count(*) AS n FROM messages WHERE target=?", s)).toEqual([{ n: 0 }]);
+    expect(await sql("SELECT count(*) AS n FROM receipts WHERE client=?", s)).toEqual([{ n: 0 }]);
+    expect(await sql("SELECT count(*) AS n FROM wait_tokens WHERE client=?", s)).toEqual([{ n: 0 }]);
+    expect(await sql("SELECT text FROM messages ORDER BY seq")).toEqual([{ text: "to the client" }, { text: "never handled" }]);
+    // Joining again by name starts the same id afresh: its own mailbox is empty, and the moved mail is in the shared one.
     expect(await join("old-task")).toBe(s);
-    expect(await mailbox(s)).toEqual([]);
+    expect(await marked(s)).toEqual([["shared", "never handled"]]);
     expect(await mailbox()).toEqual(["never handled"]);
   });
 });
@@ -300,27 +351,25 @@ describe("session mailboxes", () => {
     const seqB = (await tool("get_messages", { session: b })).events[0].seq;
     expect((await mcpCall("acknowledge", { seq: seqB, session: a })).isError).toBe(true);
     const seqA = (await tool("get_messages", { session: a })).events[0].seq;
-    expect(await tool("acknowledge", { seq: seqA, session: a })).toEqual({ ack: seqA });
+    expect(await tool("acknowledge", { seq: seqA, session: a })).toEqual({ ack: seqA, mailbox: "session" });
     expect(await mailbox(a)).toEqual([]);
     expect(await mailbox(b)).toEqual(["for b"]);
     expect(await mailbox(bobs, BOB)).toEqual(["for bob's session"]);
   });
-  it("binds a wait token to the session it was minted with", async () => {
-    await send("alice", "client mailbox only");
+  it("binds a wait token to its session: that session's mail and the shared mailbox, never another session's", async () => {
     const [a, b] = [await join("repo-a"), await join("repo-b")];
     const forA = (await tool("wait_token", { session: a })).token as string;
     const forClient = (await tool("wait_token", {})).token as string;
-    expect(await waitFor(forA)).toBe(204);
-    expect(await waitFor(forClient)).toEqual(["client mailbox only"]);
     await send(b, "for b");
     expect(await waitFor(forA)).toBe(204);
-    // A held wait is woken by its own session's mail, and by nothing else.
+    expect(await waitFor(forClient)).toBe(204);
+    // A held wait is woken by its own session's mail, and not by another session's.
     const waiting = waitFor(forA, "?timeout=30");
     await new Promise((resolve) => setTimeout(resolve, 100));
     await send(b, "still for b");
     await send(a, "for a");
     expect(await waiting).toEqual(["for a"]);
-    expect(await waitFor(forClient)).toEqual(["client mailbox only"]);
+    expect(await waitFor(forClient)).toBe(204);
     // The REST mint (stdio adapter) is bound the same way.
     const rest = await json("wait-token", ALICE, { session: b });
     expect(await waitFor(rest.token)).toEqual(["for b", "still for b"]);
@@ -328,6 +377,70 @@ describe("session mailboxes", () => {
     await age(a, 2 * DAY);
     await waitFor(forA);
     expect((await sql("SELECT seen FROM sessions WHERE id=?", a))[0].seen).toBeGreaterThan(Date.now() - HOUR);
+  });
+  it("shows a session its client's shared mailbox too, marked, with separate acknowledgements", async () => {
+    await send("alice", "sent before any session");
+    const [a, b] = [await join("repo-a"), await join("repo-b")];
+    await send(a, "for a");
+    // Both sessions see the shared message (at-least-once); each sees only its own session mail.
+    expect(await marked(a)).toEqual([["shared", "sent before any session"], ["session", "for a"]]);
+    expect(await marked(b)).toEqual([["shared", "sent before any session"]]);
+    expect(await marked(await join("x", BOB), BOB)).toEqual([]);
+    const mail = await tool("get_messages", { session: a });
+    expect(mail.next).toBe(mail.events[1].seq);
+    // Without a session nothing is marked and only the shared mailbox is read.
+    expect((await tool("get_messages", {})).events).toEqual([expect.not.objectContaining({ mailbox: expect.anything() })]);
+    expect(await mailbox()).toEqual(["sent before any session"]);
+    // The session's wait token reads the same view, and the REST read marks it the same way.
+    const token = (await tool("wait_token", { session: a })).token as string;
+    expect(await waitFor(token)).toEqual(["sent before any session", "for a"]);
+    expect((await json(`messages?session=${a}`)).events.map((e: any) => e.mailbox)).toEqual(["shared", "session"]);
+    // Acknowledging the session mailbox (the default) leaves the shared message for everyone.
+    const top = mail.next;
+    expect(await tool("acknowledge", { seq: top, session: a })).toEqual({ ack: top, mailbox: "session" });
+    expect(await marked(a)).toEqual([["shared", "sent before any session"]]);
+    // Acknowledging it as shared, from a session, acknowledges it in the shared mailbox.
+    expect(await tool("acknowledge", { seq: mail.events[0].seq, session: a, mailbox: "shared" })).toEqual({ ack: mail.events[0].seq, mailbox: "shared" });
+    expect(await marked(a)).toEqual([]);
+    expect(await marked(b)).toEqual([]);
+    expect(await mailbox()).toEqual([]);
+    expect(await waitFor(token)).toBe(204);
+    // The REST acknowledge takes the same marker; a session marker needs a session.
+    await send("bob", "shared again");
+    const bobs = await join("x", BOB);
+    const seq = (await tool("get_messages", { session: bobs }, BOB)).events[0].seq;
+    expect(await json("ack", BOB, { seq, session: bobs, mailbox: "shared" })).toEqual({ ack: seq, mailbox: "shared" });
+    expect(await mailbox(undefined, BOB)).toEqual([]);
+    expect((await req("ack", BOB, { seq, mailbox: "session" })).status).toBe(400);
+    expect((await req("ack", BOB, { seq, mailbox: "other" })).status).toBe(400);
+    expect((await mcpCall("acknowledge", { seq, mailbox: "session" }, BOB)).isError).toBe(true);
+  });
+  it("wakes a session's parked wait on shared mail, and counts a parked session as live for fan-out", async () => {
+    const a = await join("repo-a");
+    const token = (await tool("wait_token", { session: a })).token as string;
+    // Not seen for over an hour and nothing waiting: a message to the client goes to the shared mailbox.
+    await age(a, SESSION_LIVE_MS + 60_000);
+    expect(await send("alice", "while idle")).toEqual(["alice"]);
+    // The session's wait returns it at once.
+    expect(await waitFor(token, "?timeout=30")).toEqual(["while idle"]);
+    const first = (await tool("get_messages", { session: a })).events[0];
+    expect(first.mailbox).toBe("shared");
+    await tool("acknowledge", { seq: first.seq, session: a, mailbox: "shared" });
+    // A parked wait is woken by mail put in the shared mailbox directly (here: a reply to a session-less message).
+    let waiting = waitFor(token, "?timeout=30");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await sql("INSERT INTO messages(id,target,text,kind,created) VALUES('direct','alice','into the shared mailbox','message',1)");
+    await runInDurableObject(room(), (o: ProjectRoom) => (o as any).notify("alice"));
+    expect(await waiting).toEqual(["into the shared mailbox"]);
+    const seq = (await tool("get_messages", { session: a })).events[0].seq;
+    await tool("acknowledge", { seq, session: a, mailbox: "shared" });
+    // A wait parked right now makes the session live even if it was last seen long ago.
+    waiting = waitFor(token, "?timeout=30");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await age(a, SESSION_LIVE_MS + 60_000);
+    expect(await send("alice", "while waiting")).toEqual([a]);
+    expect(await waiting).toEqual(["while waiting"]);
+    expect(await marked(a)).toEqual([["session", "while waiting"]]);
   });
 });
 
@@ -364,7 +477,7 @@ describe("routing", () => {
   });
   it("delivers send_message to one session, to a client's live sessions, or to all", async () => {
     const [a1, a2, stale] = [await join("one"), await join("two"), await join("stale")];
-    await age(stale, DAY + HOUR);
+    await age(stale, SESSION_LIVE_MS + 60_000);
     // A session id reaches exactly that session, live or not.
     expect(await send(a1, "to one")).toEqual([a1]);
     expect(await send(stale, "to stale")).toEqual([stale]);
@@ -388,7 +501,7 @@ describe("routing", () => {
     const first = await rpc(room(), "send", "demo", "bob", "once", "stable-id");
     const bobs = await join("late", BOB);
     expect(await rpc(room(), "send", "demo", "bob", "once", "stable-id")).toEqual(first);
-    expect(await mailbox(bobs, BOB)).toEqual([]);
+    expect(await marked(bobs, BOB)).toEqual([["shared", "to bob"], ["shared", "to all"], ["shared", "once"]]);
     await expect(rpc(room(), "send", "demo", bobs, "once", "stable-id")).rejects.toMatchObject({ status: 409 });
     await expect(rpc(room(), "send", "demo", "ses_" + "0".repeat(40), "x", "unknown")).rejects.toMatchObject({ status: 404 });
   });
@@ -434,7 +547,7 @@ describe("compatibility", () => {
     );
     for (const name of ["message", "get_messages", "acknowledge", "wait_token"]) {
       expect(tools[name].inputSchema.properties.session.description).toBe(
-        "The session id from join. Without it, this client's shared mailbox is used.",
+        "The session id from join. Without it, only this client's shared mailbox is used.",
       );
       expect(tools[name].inputSchema.required ?? []).not.toContain("session");
     }

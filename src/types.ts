@@ -24,6 +24,8 @@ export type Message = {
   kind: string;
   requestId: string | null;
   created: number;
+  /** Only on a session's read: whether the message is in the session's own mailbox or its client's shared one. */
+  mailbox?: "session" | "shared";
 };
 export type Job = {
   id: string;

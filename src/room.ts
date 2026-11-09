@@ -9,19 +9,24 @@ import {
   type WorkerEnv,
 } from "./types.ts";
 import { automaticEnrollmentLimit, automaticMailboxId, explicitMailbox } from "./enrollment.ts";
-import { clean, clientLabel, displayName, sessionName } from "./names.ts";
+import { clean, clientLabel, displayName, plain, sessionName } from "./names.ts";
 type OAuthMailbox = { id: string; userId: string; oauthClientId: string; suspended: number };
 /** Survives hibernation with the socket: which mailbox it watches (a client id or a session id), and from where. */
-type Socket = { client: string; after: number };
+type Socket = { client: string; after: number; shared?: string };
 /** A verified GitHub profile. Only the Worker, after checking the identity with GitHub, passes one in. */
 export type Profile = { login: string; name: string };
 /** A named mailbox under one client. Its id is also its mailbox id in messages, receipts and wait tokens. */
 type Session = { id: string; client: string; name: string; created: number; seen: number };
-/** An authorized client: the verified person behind it, a grouping key for that person, and its client label. */
-type Known = { person: string; key: string; label: string };
+/**
+ * An authorized client: the verified person behind it (as shown, with "(@login)" when two people share a name),
+ * a grouping key for that person, their plain name and GitHub login, and the client label.
+ */
+type Known = { person: string; key: string; label: string; name: string; login?: string };
 export const MAX_WAIT_SECONDS = 50;
-/** A client's messages are copied to its sessions seen within this time. */
-export const SESSION_LIVE_MS = 24 * 3600_000;
+/** A client's messages are copied to its sessions seen within this time, or waiting right now. */
+export const SESSION_LIVE_MS = 3600_000;
+/** At the session cap, a session unseen for this long gives way to a new one. */
+export const SESSION_IDLE_MS = 24 * 3600_000;
 /** A session unseen for this long ends; its unacknowledged messages move to the client mailbox. */
 export const SESSION_EXPIRY_MS = 7 * 24 * 3600_000;
 export const MAX_SESSIONS = 20;
@@ -181,23 +186,33 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     const people = new Map(sql.exec<Profile & { userId: string }>("SELECT * FROM people").toArray().map((r) => [r.userId, r]));
     const labels = new Map(sql.exec<{ client: string; name: string }>("SELECT client,name FROM client_info").toArray().map((r) => [r.client, r.name]));
     // The person is never taken from a tool argument or a self-asserted app name: GitHub's verified profile, or the operator's registry.
-    const github = (userId: string, fallback: string) => {
-      const profile = people.get(userId);
-      return profile?.name || profile?.login || fallback;
+    const github = (id: string, userId: string, fallback: string): Known => {
+      const profile = people.get(userId),
+        login = plain(profile?.login ?? ""),
+        name = plain(profile?.name ?? "") || login || fallback;
+      return { person: name, name, key: `github:${userId}`, label: clientLabel(labels.get(id)), ...(login ? { login } : {}) };
     };
     for (const [id, c] of Object.entries(p.clients as Record<string, ClientConfig>)) {
       const name = clean(c.name, 60) || id;
       clients[id] = c.github
-        ? { person: github(c.github.userId, name), key: `github:${c.github.userId}`, label: clientLabel(labels.get(id)) }
-        : { person: name, key: `name:${name}`, label: clientLabel(labels.get(id)) };
+        ? github(id, c.github.userId, name)
+        : { person: name, name, key: `name:${name}`, label: clientLabel(labels.get(id)) };
     }
     for (const row of sql.exec<OAuthMailbox>("SELECT * FROM oauth_mailboxes WHERE suspended=0")) {
       if (!automaticEnrollmentLimit(p, row.userId, row.oauthClientId) || Object.hasOwn(clients, row.id)) continue;
       // A newly configured manual mapping replaces, never aliases, the automatic mailbox.
       try { if (explicitMailbox(p, row.userId, row.oauthClientId)) continue; }
       catch { continue; }
-      clients[row.id] = { person: github(row.userId, `GitHub ${row.userId}`), key: `github:${row.userId}`, label: clientLabel(labels.get(row.id)) };
+      clients[row.id] = github(row.id, row.userId, `GitHub ${row.userId}`);
     }
+    // Two people with the same name are told apart by their GitHub login.
+    const sharing = new Map<string, Set<string>>();
+    for (const c of Object.values(clients)) {
+      const who = sharing.get(c.name.toLowerCase()) ?? new Set();
+      sharing.set(c.name.toLowerCase(), who.add(c.key));
+    }
+    for (const c of Object.values(clients))
+      if (c.login && sharing.get(c.name.toLowerCase())!.size > 1) c.person = `${c.name} (@${c.login})`;
     return clients;
   }
   private touch(mailbox: string, now: number) {
@@ -232,7 +247,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     for (const s of this.ctx.storage.sql.exec<Session>("SELECT * FROM sessions WHERE seen<=?", now - SESSION_EXPIRY_MS).toArray())
       this.retire(s);
   }
-  /** End a session: what it never acknowledged moves to its client's mailbox, so nothing is lost. */
+  /** End a session: what it never acknowledged moves to its client's mailbox, so nothing is lost. The rest is deleted. */
   private retire(s: Session) {
     const sql = this.ctx.storage.sql;
     this.ctx.storage.transactionSync(() => {
@@ -244,17 +259,25 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
         s.id,
         ack,
       ).rowsWritten;
-      sql.exec("DELETE FROM messages WHERE target=? AND seq>?", s.id, ack);
+      sql.exec("DELETE FROM messages WHERE target=?", s.id);
+      sql.exec("DELETE FROM receipts WHERE client=?", s.id);
       sql.exec("DELETE FROM wait_tokens WHERE client=?", s.id);
       sql.exec("DELETE FROM sessions WHERE id=?", s.id);
       if (moved) this.notify(s.client);
     });
     this.closeSockets(s.id);
   }
-  private sessionsOf(client: string, seenAfter = 0) {
+  private sessionsOf(client: string) {
     return this.ctx.storage.sql
-      .exec<Session>("SELECT * FROM sessions WHERE client=? AND seen>? ORDER BY created,id", client, seenAfter)
+      .exec<Session>("SELECT * FROM sessions WHERE client=? ORDER BY created,id", client)
       .toArray();
+  }
+  private open(tag?: string) {
+    return this.ctx.getWebSockets(tag).filter((ws) => ws.readyState === WebSocket.OPEN);
+  }
+  /** Sessions that will read a message soon: one with a wait parked right now, or seen within the last hour. */
+  private liveSessions(client: string, now: number) {
+    return this.sessionsOf(client).filter((s) => s.seen > now - SESSION_LIVE_MS || this.open(s.id).length > 0);
   }
   /**
    * Create or resume a named session under the calling client. The same name is always the same session id,
@@ -275,8 +298,8 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     else {
       const all = sql.exec<Session>("SELECT * FROM sessions WHERE client=? ORDER BY seen", client).toArray();
       if (all.length >= MAX_SESSIONS) {
-        // Room is made by ending the longest-idle session, never one that is live.
-        const idle = all[0].seen <= now - SESSION_LIVE_MS ? all[0] : undefined;
+        // Room is made by ending the longest-idle session: never one seen in the last day or waiting right now.
+        const idle = all.find((s) => s.seen <= now - SESSION_IDLE_MS && !this.open(s.id).length);
         if (!idle)
           throw new Failure(429, `This client already has ${MAX_SESSIONS} live sessions; join one of them by name`);
         this.retire(idle);
@@ -343,12 +366,39 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
       .toArray();
     return { events, next: events.at(-1)?.seq ?? from };
   }
+  /**
+   * A session's view: its own mailbox and its client's shared mailbox, each message marked with which one it is in.
+   * Mail sent to the client while no session was live is therefore never stranded. Each mailbox keeps its own
+   * acknowledgement, and several sessions may see the same shared message (delivery is at-least-once).
+   * Sequence numbers are unique across mailboxes, so one cursor orders both.
+   */
+  private pendingBoth(session: string, client: string, after: number, limit = 50) {
+    const sql = this.ctx.storage.sql;
+    const ack = (id: string) => sql.exec<{ ack: number }>("SELECT ack FROM receipts WHERE client=?", id).toArray()[0]?.ack ?? 0;
+    const own = ack(session),
+      shared = ack(client);
+    const events = sql
+      .exec<Message>(
+        "SELECT * FROM messages WHERE ((target=? AND seq>?) OR (target=? AND seq>?)) AND seq>? ORDER BY seq LIMIT ?",
+        session,
+        own,
+        client,
+        shared,
+        after,
+        limit,
+      )
+      .toArray()
+      .map((e) => ({ ...e, mailbox: e.target === session ? ("session" as const) : ("shared" as const) }));
+    return { events, next: events.at(-1)?.seq ?? Math.max(after, own, shared) };
+  }
   async read(project: string, client: string, after = 0, session?: string | null) {
-    return this.pending(await this.enter(project, client, session), after);
+    const mailbox = await this.enter(project, client, session);
+    return mailbox === client ? this.pending(client, after) : this.pendingBoth(mailbox, client, after);
   }
   /**
-   * A narrow credential for a shell command: it can only read one mailbox, this client's own or,
-   * when minted with a session, only that session's. Only its hash is stored. The raw value is returned once.
+   * A narrow credential for a shell command: it can only read what its minter can, this client's shared mailbox
+   * or, when minted with a session, that session's view (its own mailbox and the shared one), never another
+   * session's. Only its hash is stored. The raw value is returned once.
    */
   async mintWaitToken(project: string, client: string, ttlMinutes: number, session?: string | null) {
     // The token row's `client` column holds the mailbox id: a client id, or a session id.
@@ -399,8 +449,9 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
   private flush() {
     const targets = [...this.dirty];
     this.dirty.clear();
+    // A session's parked wait also watches its client's shared mailbox.
     for (const client of targets)
-      for (const ws of this.ctx.getWebSockets(client)) this.signal(ws);
+      for (const ws of [...this.ctx.getWebSockets(client), ...this.ctx.getWebSockets(`shared:${client}`)]) this.signal(ws);
   }
   /**
    * Internal only. The Worker authenticates the caller, holds its HTTP request and parks this socket here,
@@ -413,12 +464,12 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     try {
       wanted = JSON.parse(request.headers.get("X-Lead-Socket") || "{}");
     } catch {}
-    let client = String(wanted.client || "");
+    const owner = String(wanted.client || "");
+    let client = owner;
     try {
       // From here `client` is the mailbox being watched: the client's own, or one of its sessions.
-      client = await this.enter(String(wanted.project || ""), client, wanted.session);
-      const open = (tag?: string) =>
-        this.ctx.getWebSockets(tag).filter((ws) => ws.readyState === WebSocket.OPEN);
+      client = await this.enter(String(wanted.project || ""), owner, wanted.session);
+      const open = (tag?: string) => this.open(tag);
       if (open().length >= this.limits.projectSockets)
         throw new Failure(429, "Too many waiting requests for this project; retry later");
       // Refused, not replaced: waiting commands loop, and replacing one another would never settle.
@@ -432,8 +483,9 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
       );
     }
     const pair = new WebSocketPair();
-    this.ctx.acceptWebSocket(pair[1], [client]);
-    pair[1].serializeAttachment({ client, after: Number(wanted.after) || 0 } satisfies Socket);
+    const shared = client === owner ? undefined : owner;
+    this.ctx.acceptWebSocket(pair[1], shared ? [client, `shared:${shared}`] : [client]);
+    pair[1].serializeAttachment({ client, after: Number(wanted.after) || 0, ...(shared ? { shared } : {}) } satisfies Socket);
     // Mail that arrived between the caller's read and this connect is not missed.
     this.signal(pair[1]);
     return new Response(null, { status: 101, webSocket: pair[0] });
@@ -441,7 +493,11 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
   private signal(ws: WebSocket) {
     try {
       const a = ws.deserializeAttachment() as Socket | null;
-      if (a && ws.readyState === WebSocket.OPEN && this.pending(a.client, a.after, 1).events.length)
+      if (
+        a &&
+        ws.readyState === WebSocket.OPEN &&
+        (a.shared ? this.pendingBoth(a.client, a.shared, a.after, 1) : this.pending(a.client, a.after, 1)).events.length
+      )
         ws.send("mail");
     } catch {
       // The mailbox is durable; the waiting request reads it when its time is up.
@@ -454,33 +510,44 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     } catch {}
   }
   webSocketError() {}
-  async ack(project: string, client: string, seq: number, session?: string | null) {
-    client = await this.enter(project, client, session);
+  /**
+   * Acknowledge one mailbox through `seq`. A session acknowledges its own mailbox unless it says "shared",
+   * which acknowledges its client's shared mailbox for every session of that client.
+   */
+  async ack(project: string, client: string, seq: number, session?: string | null, box?: "session" | "shared" | null) {
+    const mailbox = await this.enter(project, client, session);
+    if (box != null && box !== "session" && box !== "shared") throw new Failure(400, 'mailbox must be "session" or "shared"');
+    if (box === "session" && mailbox === client)
+      throw new Failure(400, "A session id is required to acknowledge a session mailbox");
+    // What the caller has seen: its own mailbox and, for a session, the shared one too.
     const max =
       this.ctx.storage.sql
         .exec<{ n: number | null }>(
-          "SELECT max(seq) AS n FROM messages WHERE target=?",
+          "SELECT max(seq) AS n FROM messages WHERE target IN (?,?)",
+          mailbox,
           client,
         )
         .one().n || 0;
     if (seq > max) throw new Failure(400, "Cannot acknowledge unseen sequence");
+    const acked = box === "shared" ? "shared" : mailbox === client ? undefined : "session";
+    client = box === "shared" ? client : mailbox;
     this.ctx.storage.sql.exec(
       "UPDATE receipts SET ack=max(ack,?) WHERE client=?",
       seq,
       client,
     );
-    return { ack: seq };
+    return { ack: seq, ...(acked ? { mailbox: acked } : {}) };
   }
   /** People, their clients, and each client's named sessions. Ids are what the lead's send_message accepts. */
   participants(project: string) {
     this.expireSessions();
     const iso = (ms?: number) => (ms ? new Date(ms).toISOString() : null);
-    const people = new Map<string, { name: string; clients: unknown[] }>();
+    const people = new Map<string, { name: string; login?: string; clients: unknown[] }>();
     for (const [id, c] of Object.entries(this.clients(project))) {
       const seen = this.ctx.storage.sql
         .exec<{ seen: number }>("SELECT seen FROM receipts WHERE client=?", id)
         .toArray()[0]?.seen;
-      const person = people.get(c.key) ?? { name: c.person, clients: [] };
+      const person = people.get(c.key) ?? { name: c.name, ...(c.login ? { login: c.login } : {}), clients: [] };
       people.set(c.key, person);
       person.clients.push({
         id,
@@ -507,9 +574,10 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     const now = Date.now();
     this.expireSessions(now);
     const clients = this.clients(project);
-    // A client's message is copied to each of its live sessions, or kept in the client mailbox when it has none.
+    // A client's message is copied to each of its live sessions, or kept in the shared client mailbox
+    // (which every one of its sessions reads) when it has none.
     const boxes = (client: string) => {
-      const live = this.sessionsOf(client, now - SESSION_LIVE_MS).map((s) => s.id);
+      const live = this.liveSessions(client, now).map((s) => s.id);
       return live.length ? live : [client];
     };
     let targets: string[];

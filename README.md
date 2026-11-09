@@ -185,7 +185,9 @@ session: `Miguel's Claude Code · chiridion-2`.
 - **Person** comes from verified identity, never from a tool argument: the
   GitHub profile name (else the login) for GitHub sign-in, or the registry's
   `name` for a static bearer client. An enrollment made before names were stored
-  shows as `GitHub <id>` until its next request, which stores the name.
+  shows as `GitHub <id>` until its next request, which stores the name. The
+  GitHub login is always kept and listed by `participants`; when two people in
+  a project have the same name, both are shown as `<Name> (@login)`.
 - **Client** comes from the MCP `clientInfo` the client sends in `initialize`
   (`Claude Code`, `Codex`, `pi`, `Cursor`; otherwise its own name, shortened;
   `agent` when unknown). It is a self-reported label, not an identity. The stdio
@@ -193,6 +195,9 @@ session: `Miguel's Claude Code · chiridion-2`.
 - **Session** is chosen by the agent. One client install often runs several
   agents (two repositories, two tasks); without sessions they would share one
   mailbox.
+
+A client label or session name cannot contain `·` or `'s ` (they are replaced),
+so no participant can be made to read as another.
 
 `join({ name })` creates or resumes a named session under the calling client and
 returns `{ session, displayName }`. The name is 1 to 40 printable characters on
@@ -203,24 +208,33 @@ an optional `session`:
 
 - A `message` sent with a session is shown to the lead as from that session,
   and the lead's reply goes to that session's mailbox.
-- A session reads and acknowledges only its own mailbox. Another client's
-  session id is refused like an unknown one.
+- A session reads its own mailbox and its client's shared mailbox, never
+  another session's. Each message it reads is marked `mailbox: "session"` or
+  `mailbox: "shared"`. `acknowledge({ seq, session, mailbox? })` acknowledges
+  the session's own mailbox by default and the shared one with
+  `mailbox: "shared"`. Several sessions of one client may each see the same
+  shared message until one of them acknowledges it as shared; delivery is
+  at-least-once. Another client's session id is refused like an unknown one.
 - Without `session`, every tool uses the client's own mailbox exactly as before,
   so clients that never call `join` keep working.
 
 The lead's `send_message` takes a session id, a client id or `"all"`. A message
 to a client (or to all) is copied into the mailbox of each of that client's live
-sessions (seen in the last 24 hours), or into the client mailbox when it has
-none. Each copy is acknowledged separately.
+sessions (a wait parked right now, or seen in the last hour), or into the
+client's shared mailbox when it has none, where every one of its sessions will
+read it. Each copy is acknowledged separately.
 
-A client may have 20 live sessions; joining a 21st ends the longest-idle one if
-it has not been seen for a day, and is refused otherwise. A session not seen
-for 7 days ends. When a session ends, its unacknowledged messages move to the
-client mailbox, and joining again with its name starts it afresh under the same id.
+A client may have 20 sessions; joining a 21st ends the longest-idle one that
+has not been seen for a day and is not waiting, and is refused if there is
+none. A session not seen for 7 days ends. When a session ends, its
+unacknowledged messages move to the client's shared mailbox, the rest of its
+records are deleted, and joining again with its name starts it afresh under the
+same id.
 
 The REST routes used by the stdio adapter take the same optional `session`
 (`POST /projects/<project>/join` with `{ "name": ... }`, then `session` in the
-body of `messages`, `ack` and `wait-token`, or `?session=` on `GET messages`).
+body of `messages`, `ack` (with `mailbox`) and `wait-token`, or `?session=` on
+`GET messages`).
 
 ## Waiting for the lead
 
@@ -237,7 +251,8 @@ call blocks.
   model tokens are spent while it waits.
 
 `wait_token({ ttlMinutes?, timeoutSeconds?, follow?, session? })` returns `{ token, expiresAt, url,
-command }`. With `session`, the token reads only that session's mailbox. `ttlMinutes` is the token's life (5 to 1440, default 480).
+command }`. With `session`, the token reads what that session reads: its own
+mailbox and the client's shared one, never another session's. `ttlMinutes` is the token's life (5 to 1440, default 480).
 `timeoutSeconds` is how long the command waits overall (60 to 86400, default
 3600). The command is one self-contained POSIX `sh` line that needs only `curl`;
 nothing is downloaded. Its exit codes:
@@ -294,8 +309,9 @@ so waiting costs wall-clock time, not compute.
 - **Read-only.** A token can only read on the route above. It cannot send,
   acknowledge, list participants, mint tokens or use MCP, and client
   credentials are not accepted on that route.
-- **One mailbox, one project.** It reads only the mailbox it was minted for,
-  in that project: the client's own, or with `session` only that session's.
+- **One reader, one project.** It reads only what its minter reads, in that
+  project: the client's shared mailbox, or with `session` that session's own
+  mailbox and the shared one, never another session's.
   Removing or suspending the client, or the session ending, stops its tokens.
 - **Short-lived.** It expires after `ttlMinutes`. Only its SHA-256 hash is stored.
 - **Five live tokens per mailbox.** Minting a sixth drops the oldest; mint anew

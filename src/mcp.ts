@@ -8,6 +8,7 @@ import type { ProjectRoom } from "./room.ts";
 
 export { CLIENT_INSTRUCTIONS, TOOL_TEXT };
 const session = z.string().min(1).max(80).optional().describe(TOOL_TEXT.session);
+const mailbox = z.enum(["session", "shared"]).optional().describe(TOOL_TEXT.mailbox);
 export const waitTokenInput = z.object({
   ttlMinutes: z.number().int().min(5).max(1440).default(480),
   timeoutSeconds: z.number().int().min(60).max(86400).default(3600),
@@ -108,9 +109,9 @@ export async function mcp(
     "acknowledge",
     {
       description: TOOL_TEXT.acknowledge,
-      inputSchema: { seq: z.number().int().nonnegative(), session },
+      inputSchema: { seq: z.number().int().nonnegative(), session, mailbox },
     },
-    safe((args) => rpc(room, "ack", project, client, args.seq, args.session)),
+    safe((args) => rpc(room, "ack", project, client, args.seq, args.session, args.mailbox)),
   );
   server.registerTool(
     "participants",

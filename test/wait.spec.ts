@@ -193,7 +193,7 @@ describe("MCP tools", () => {
     const tools = Object.fromEntries(listed.result.tools.map((t: any) => [t.name, t.description]));
     expect(Object.keys(tools)).toEqual(["join", "message", "get_messages", "wait_token", "acknowledge", "participants"]);
     expect(tools.get_messages).toBe(
-      "Check your mailbox now: unacknowledged replies and messages from the lead for this client (up to 50). To wait without checking, use wait_token.",
+      "Check your mailbox now: unacknowledged replies and messages from the lead for this client (up to 50). To wait without checking, use wait_token. With a session, also returns the client's shared mailbox.",
     );
     expect(tools.wait_token).toBe(
       "Get a short-lived token and a shell command that waits for your next message from the lead. Run the command in the background: it exits 0 printing the messages when any arrive, 2 if none came before its timeout, 3 if the token expired (call wait_token again). The token can only read this client's mailbox. With follow: true the command keeps running and prints each batch of messages as one line, for clients that can watch a command's output.",
