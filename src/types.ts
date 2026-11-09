@@ -2,7 +2,8 @@ import { timingSafeEqual } from "node:crypto";
 import { verifyRuntimeToken } from "@camelai/run/server";
 export interface ClientConfig {
   name: string;
-  tokenHash: string;
+  tokenHash?: string;
+  github?: { userId: string; oauthClientId: string };
 }
 export interface ProjectConfig {
   agentId: string;
@@ -29,6 +30,9 @@ export type Job = {
 export interface Secrets {
   CAMELRUN_API_KEY: string;
   PROJECTS_JSON: string;
+  OAUTH_KV?: KVNamespace;
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
   RUNTIME?: Fetcher;
   CAMELRUN_ISSUER?: string;
 }
@@ -97,7 +101,7 @@ export async function clientAuth(request: Request, p: ProjectConfig) {
     request.headers.get("authorization")?.replace(/^Bearer /, "") || "";
   if (!token) throw new Failure(401, "Bearer credential required");
   for (const [id, client] of Object.entries(p.clients))
-    if (await matches(token, client.tokenHash)) return id;
+    if (client.tokenHash && await matches(token, client.tokenHash)) return id;
   throw new Failure(401, "Invalid client credential");
 }
 /** camelRun signs each request; the adapter stores no lead private/shared key. */

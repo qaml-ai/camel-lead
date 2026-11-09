@@ -1,3 +1,4 @@
+import { oauthRoute, oauthClient, oauthEnabled } from "./oauth.ts";
 import { z } from "zod";
 import {
   rpc,
@@ -15,9 +16,11 @@ const message = z.object({
   requestId: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
 });
 export default {
-  async fetch(request: Request, env: WorkerEnv): Promise<Response> {
+  async fetch(request: Request, env: WorkerEnv, ctx: ExecutionContext): Promise<Response> {
     try {
       const url = new URL(request.url);
+      const authResponse = await oauthRoute(request, env, ctx);
+      if (authResponse) return authResponse;
       if (url.pathname === "/healthz") return Response.json({ ok: true });
       const match =
         /^\/(projects|agent)\/([A-Za-z0-9_-]{1,80})\/(mcp|messages|ack|participants|send)$/.exec(
@@ -39,7 +42,12 @@ export default {
           project,
         );
       }
-      const client = await clientAuth(request, p);
+      let client: string;
+      try { client = await clientAuth(request, p); }
+      catch (error) {
+        if (!oauthEnabled(env)) throw error;
+        client = await oauthClient(request, env, project, p);
+      }
       if (action === "mcp") {
         if (request.method !== "POST")
           return Response.json(
@@ -95,7 +103,12 @@ export default {
                 ? error.message
                 : "Invalid input",
         },
-        { status, headers: { "Cache-Control": "no-store" } },
+        { status, headers: {
+          "Cache-Control": "no-store",
+          ...(status === 401 && oauthEnabled(env) && new URL(request.url).pathname.startsWith('/projects/') ? {
+            'WWW-Authenticate': `Bearer resource_metadata="${env.CAMEL_LEAD_URL}/.well-known/oauth-protected-resource${new URL(request.url).pathname.replace(/\/(messages|ack|participants)$/, '/mcp')}", scope="lead:messages"`
+          } : {}),
+        } },
       );
     }
   },

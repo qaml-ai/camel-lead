@@ -247,3 +247,7 @@ Claude reference: https://code.claude.com/docs/en/channels-reference
 Codex restriction: https://github.com/openai/codex/blob/6222faa3c463442b3788b2690108568786f6ffc7/codex-rs/app-server/src/request_processors/mcp_event_stream.rs
 
 CI checks every push/PR. There is deliberately **no automatic deployment workflow**.
+
+### GitHub organization sign-in
+
+Remote MCP clients can sign in through GitHub, restricted to active `qaml-ai` members with explicit project/mailbox grants. This is separate from the lead's signed runtime identity. See [GitHub OAuth setup, security and client limitations](docs/github-auth.md). Real credentials and a dedicated OAuth KV binding are deployment prerequisites; no Access configuration is required.

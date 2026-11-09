@@ -15,6 +15,7 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
+        kvNamespaces: ["OAUTH_KV"],
         bindings: {
           CAMELRUN_API_KEY: "runtime-test-only",
           CAMEL_LEAD_URL: "https://lead.test",
@@ -23,5 +24,5 @@ export default defineConfig({
       },
     }),
   ],
-  test: { include: ["test/worker.spec.ts"], fileParallelism: false },
+  test: { include: ["test/worker.spec.ts", "test/oauth.spec.ts"], fileParallelism: false },
 });
