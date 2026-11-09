@@ -10,15 +10,17 @@ import {
   leadAuth,
   type WorkerEnv,
 } from "./types.ts";
-import { mcp, leadMcp } from "./mcp.ts";
+import { mcp, leadMcp, mintWait } from "./mcp.ts";
 import { MAX_WAIT_SECONDS } from "./room.ts";
 export { ProjectRoom } from "./room.ts";
 const optional = (v: string | null) => v ?? undefined;
-/** Longer waits are clamped, not refused: 50 s stays under common 60 s client request limits. */
-const waitQuery = z.object({
-  wait: z.coerce.number().int().min(0).default(0).transform((n) => Math.min(n, MAX_WAIT_SECONDS)),
+/** Longer waits are clamped, not refused. 50 s stays under the 60 s limits common in HTTP clients and proxies. */
+const tokenWaitQuery = z.object({
+  timeout: z.coerce.number().int().min(0).default(25).transform((n) => Math.min(n, MAX_WAIT_SECONDS)),
   after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
 });
+const ackBody = z.object({ seq: z.number().int().nonnegative() });
+const origin = (env: WorkerEnv) => env.CAMEL_LEAD_URL.replace(/\/+$/, "");
 const message = z.object({
   text: z.string().min(1).max(16_000),
   requestId: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
@@ -31,7 +33,7 @@ export default {
       if (authResponse) return authResponse;
       if (url.pathname === "/healthz") return Response.json({ ok: true });
       const match =
-        /^\/(projects|agent)\/([A-Za-z0-9_-]{1,80})\/(mcp|messages|ack|participants|send|ws)$/.exec(
+        /^\/(projects|agent)\/([A-Za-z0-9_-]{1,80})\/(mcp|messages|ack|participants|send|wait|wait-token)$/.exec(
           url.pathname,
         );
       if (!match) throw new Failure(404, "Not found");
@@ -50,24 +52,26 @@ export default {
           project,
         );
       }
-      let client: string, auth = "bearer";
+      if (action === "wait") {
+        // The only blocking read. A wait token is accepted here and nowhere else, and can only read.
+        if (request.method !== "GET") throw new Failure(405, "Method not allowed");
+        const token = /^Bearer (\S+)$/.exec(request.headers.get("authorization") || "")?.[1] || "";
+        const owner: string = await rpc(room, "waitTokenClient", project, token);
+        const q = tokenWaitQuery.parse({
+          timeout: optional(url.searchParams.get("timeout")),
+          after: optional(url.searchParams.get("after")),
+        });
+        const mail = await waitRead(room, project, owner, q.timeout, q.after);
+        // 200 with mail, 204 with nothing yet: a shell loop needs only the status.
+        return mail.events.length
+          ? Response.json(mail, { headers: { "Cache-Control": "no-store" } })
+          : new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
+      }
+      let client: string;
       try { client = await clientAuth(request, p); }
       catch (error) {
         if (!oauthEnabled(env)) throw error;
         client = await oauthClient(request, env, project, p);
-        auth = "oauth";
-      }
-      if (action === "ws") {
-        if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket")
-          throw new Failure(426, "WebSocket upgrade required");
-        const { after } = waitQuery.parse({ after: optional(url.searchParams.get("after")) });
-        // The room trusts these values; they are derived here, never copied from the caller.
-        // A header, not the URL: the credential hash must stay out of request logs and traces.
-        const socket = JSON.stringify({
-          project, client, auth, after,
-          key: auth === "bearer" ? p.clients[client]?.tokenHash ?? null : null,
-        });
-        return await room.fetch(new Request("https://room/ws", { headers: { Upgrade: "websocket", "X-Lead-Socket": socket } }));
       }
       if (action === "mcp") {
         if (request.method !== "POST")
@@ -81,17 +85,18 @@ export default {
           room,
           project,
           client,
+          origin(env),
         );
       }
-      if (action === "messages" && request.method === "GET") {
-        const q = waitQuery.parse({
-          wait: optional(url.searchParams.get("wait")),
-          after: optional(url.searchParams.get("after")),
-        });
-        return Response.json(await waitRead(room, project, client, q.wait, q.after), {
+      if (action === "wait-token" && request.method === "POST")
+        return Response.json(
+          await mintWait(room, origin(env), project, client, await boundedJson(request)),
+          { headers: { "Cache-Control": "no-store" } },
+        );
+      if (action === "messages" && request.method === "GET")
+        return Response.json(await rpc(room, "read", project, client), {
           headers: { "Cache-Control": "no-store" },
         });
-      }
       if (action === "messages" && request.method === "POST") {
         const body = message.parse(await boundedJson(request));
         return Response.json(
@@ -100,9 +105,7 @@ export default {
         );
       }
       if (action === "ack" && request.method === "POST") {
-        const { seq } = z
-          .object({ seq: z.number().int().nonnegative() })
-          .parse(await boundedJson(request));
+        const { seq } = ackBody.parse(await boundedJson(request));
         return Response.json(await rpc(room, "ack", project, client, seq));
       }
       if (action === "participants" && request.method === "GET")
@@ -133,8 +136,8 @@ export default {
         },
         { status, headers: {
           "Cache-Control": "no-store",
-          ...(status === 401 && oauthEnabled(env) && new URL(request.url).pathname.startsWith('/projects/') ? {
-            'WWW-Authenticate': `Bearer resource_metadata="${env.CAMEL_LEAD_URL}/.well-known/oauth-protected-resource${new URL(request.url).pathname.replace(/\/(messages|ack|participants|ws)$/, '/mcp')}", scope="lead:messages"`
+          ...(status === 401 && oauthEnabled(env) && /^\/projects\/[^/]+\/(mcp|messages|ack|participants|wait-token)$/.test(new URL(request.url).pathname) ? {
+            'WWW-Authenticate': `Bearer resource_metadata="${env.CAMEL_LEAD_URL}/.well-known/oauth-protected-resource${new URL(request.url).pathname.replace(/\/(messages|ack|participants|wait-token)$/, '/mcp')}", scope="lead:messages"`
           } : {}),
         } },
       );

@@ -11,21 +11,16 @@ participants()                         # authorized clients and last adapter con
 send_message(target, text, messageId)   # one client, or target="all"
 ```
 
-Clients use `message`, `wait_for_messages`, `get_messages`, `acknowledge`, and
-`participants`. Multiple clients can submit simultaneously to **one shared agent
+Clients use `message`, `get_messages`, `acknowledge`, `participants` and
+`wait_token`. Multiple clients can submit simultaneously to **one shared agent
 and conversation**. camelRun serializes their turns. A normal final reply goes
 back to its caller; the lead can also proactively message any authorized client.
 Durable SQLite mailboxes preserve messages when a client disconnects. No VM,
 helper process or permanent socket is needed.
 
-Nothing is pushed into a coding client. A client **waits** for its mail, in one of
-three standard ways that all read the same durable mailbox:
-
-| Way                          | Use it when                                                    | Cost while waiting                   |
-| ---------------------------- | -------------------------------------------------------------- | ------------------------------------ |
-| `wait_for_messages` MCP tool | Any MCP client; no helper process                              | One held tool call, up to 50 s each  |
-| `clients/wait.ts` CLI        | The agent can run a background shell command                   | No model tokens; server can sleep    |
-| WebSocket `/projects/:p/ws`  | Your own long-lived process                                    | Server hibernates while idle         |
+Nothing is pushed into a coding client. A client checks its mailbox with
+`get_messages`, or [waits for the lead](#waiting-for-the-lead) with a background
+shell command that exits when mail arrives.
 
 ## Status
 
@@ -34,17 +29,17 @@ Implemented and locally tested in real workerd, with synthetic camelRun response
 This is an operator-configured, trusted project/team adapter, not a public signup
 service. A public source repository does not mean anonymous access to projects.
 
-| Client                   | Conversation                                 | Getting updates from the lead                                 |
-| ------------------------ | -------------------------------------------- | ------------------------------------------------------------- |
-| Claude Code              | Remote MCP or included stdio adapter         | `wait_for_messages`, or the wait CLI as a background command  |
-| Codex                    | Remote MCP or included stdio adapter         | `wait_for_messages`, or the wait CLI                          |
-| OpenCode                 | Remote MCP or included stdio adapter         | `wait_for_messages`, or the wait CLI                          |
-| Cursor/other MCP clients | Remote MCP tools                             | `wait_for_messages`                                           |
-| ChatGPT                  | MCP client capable of configured bearer auth | `wait_for_messages`; no hosted connector registration         |
+| Client                   | Conversation                                 | Getting updates from the lead                                  |
+| ------------------------ | -------------------------------------------- | -------------------------------------------------------------- |
+| Claude Code              | Remote MCP or included stdio adapter         | `wait_token` command in background Bash, or `get_messages`     |
+| Codex                    | Remote MCP or included stdio adapter         | `wait_token` command as a background command, or `get_messages` |
+| OpenCode                 | Remote MCP or included stdio adapter         | `wait_token` command as a background command, or `get_messages` |
+| Cursor/other MCP clients | Remote MCP tools                             | `get_messages`; the `wait_token` command if it has a shell     |
+| ChatGPT                  | MCP client capable of configured bearer auth | `get_messages`; no hosted connector registration               |
 
 The earlier push paths (Claude development channel, Codex app-server bridge,
-OpenCode HTTP bridge) are removed. A client learns of new mail only while it is
-waiting or when it next reads; nothing starts a turn in an idle client.
+OpenCode HTTP bridge) are removed. Nothing starts a turn in an idle client: it
+is woken by its own background command exiting, or it checks when convenient.
 
 ## Setup (operator)
 
@@ -179,58 +174,68 @@ claude mcp add project-lead -- node --experimental-strip-types /absolute/path/ca
 Register that command using the client's normal MCP configuration. Do not commit
 credential values; pass them through its supported environment mechanism.
 
-### Wait for the lead
+## Waiting for the lead
 
-**In any MCP client:** call `wait_for_messages({ timeoutSeconds?, after? })`. It
-returns as soon as mail exists, otherwise holds the call until mail arrives or
-the timeout ends (1 to 50 seconds, default 25). An empty result has
-`status: "no_new_messages"`; call it again to keep waiting. Pass the returned
-`next` as `after` to skip what you have already seen, or `acknowledge` what you
-have handled. The 50-second ceiling stays under the 60-second request limit that
-common MCP clients apply to one tool call; raise the client's own tool timeout
-if it is lower than the wait you ask for.
+Replies and messages from the lead arrive in the client's mailbox. Every MCP
+tool answers at once; no tool call blocks.
 
-**From a shell, with no tokens spent while waiting:**
+- **Check when convenient:** `get_messages` returns the unacknowledged messages
+  (or an empty list). `acknowledge` what you have handled.
+- **Be woken when something arrives:** call `wait_token`, run the command it
+  returns as a background shell command (in Claude Code: the Bash tool with
+  `run_in_background`), and carry on or stop. When the command exits, read what
+  it printed, handle it, `acknowledge` it, and start the command again. No
+  model tokens are spent while it waits.
 
-```sh
-node --experimental-strip-types clients/wait.ts demo [--timeout SECONDS] [--after SEQ] [--ack] [--poll]
+`wait_token({ ttlMinutes?, timeoutSeconds? })` returns `{ token, expiresAt, url,
+command }`. `ttlMinutes` is the token's life (5 to 1440, default 480).
+`timeoutSeconds` is how long the command waits overall (60 to 86400, default
+3600). The command is one self-contained POSIX `sh` line that needs only `curl`;
+nothing is downloaded. Its exit codes:
+
+| Exit | Meaning                                                                    |
+| ---- | -------------------------------------------------------------------------- |
+| `0`  | Mail arrived; the messages are printed as JSON (`{"events":[...],"next":N}`) |
+| `2`  | Nothing arrived before the timeout; start it again to keep waiting          |
+| `3`  | The token expired or was replaced; call `wait_token` again                  |
+
+It retries network and server errors every 5 seconds. It never acknowledges:
+until `acknowledge` is called, the same messages are printed again.
+
+### The raw protocol
+
+For your own loop:
+
+```text
+GET /projects/<project>/wait?timeout=<0..50>[&after=<seq>]
+Authorization: Bearer <wait token>
 ```
 
-It blocks until at least one message arrives, prints each as one JSON line
-(`seq`, `id`, `kind`, `requestId`, and `text` framed as external data), and exits
-`0`. With `--timeout` it exits `2` if nothing arrived; errors exit `1`. `--ack`
-acknowledges what it printed, after printing; without it, acknowledge through
-the MCP tool or pass `--after` next time. It sleeps on the WebSocket and falls
-back to chained 50-second long-polls (`--poll` forces that) when a socket cannot
-be opened.
+- `200` with `{"events":[...],"next":<seq>}` as soon as the client has
+  unacknowledged mail, at once or when it arrives. `after` skips sequences up
+  to that number without acknowledging them.
+- `204` with an empty body when `timeout` seconds pass with nothing (default 25;
+  larger values are clamped to 50). Ask again.
+- `401` when the token is unknown, expired or replaced. `429` when too many
+  requests are already waiting; retry after a pause.
 
-The pattern for a coding agent: start the command in the background, carry on or
-stop, and treat its exit as the wake-up.
+The stateless Worker holds the request. The project's Durable Object only keeps
+a hibernatable WebSocket per waiting request and can sleep until mail arrives,
+so waiting costs wall-clock time, not compute.
 
-- **Claude Code:** run it with the Bash tool's `run_in_background`. Claude is
-  notified when the command exits and reads the printed messages then. To keep
-  listening, start it again after handling them.
-- **Any other agent that can run a shell command:** run it in the background or
-  as a blocking command with `--timeout` under the client's command limit, and
-  loop on exit code `2`.
+### Security of wait tokens
 
-**From your own process:** `GET /projects/:project/ws[?after=SEQ]` with the same
-credential upgrades to a WebSocket. The server sends
-`{"type":"messages","events":[...],"next":SEQ}` once on connect if mail is pending
-and again whenever mail arrives; each socket gets an event once. Send
-`{"type":"ack","seq":SEQ}` to acknowledge (answered with `{"type":"ack","ack":SEQ}`
-or `{"type":"error",...}`). Send the text `ping` for a `pong` keepalive; the
-runtime answers it without waking the hibernating Durable Object. A socket
-closed with code `4401`, or one sent `{"type":"reauthenticate"}`, must be
-replaced by a newly authenticated request: this happens when a bearer credential
-is rotated or removed, and for GitHub-authenticated sockets whenever mail arrives
-more than a minute after connecting, because GitHub membership is rechecked on
-every request and a socket cannot do that. Code `4008` means a newer connection
-replaced this one.
-
-The plain HTTP form is `GET /projects/:project/messages?wait=SECONDS&after=SEQ`
-(`wait` 0 to 50, larger values are clamped; default 0 answers at once). It
-returns `{ "events": [...], "next": SEQ }`; an empty `events` means nothing yet.
+- **Read-only.** A token can only read on the route above. It cannot send,
+  acknowledge, list participants, mint tokens or use MCP, and client
+  credentials are not accepted on that route.
+- **One client, one project.** It reads only the mailbox of the client that
+  minted it, in that project. Removing or suspending the client stops its tokens.
+- **Short-lived.** It expires after `ttlMinutes`. Only its SHA-256 hash is stored.
+- **Five live tokens per client.** Minting a sixth drops the oldest; mint anew
+  to rotate.
+- **It appears in the model's context** and in the shell command, so treat it as
+  readable by whatever can read the conversation. That is why it is narrow.
+  Message content read with it is external data, not instructions.
 
 ## Delivery and safety
 
@@ -242,14 +247,13 @@ returns `{ "events": [...], "next": SEQ }`; an empty `events` means nothing yet.
 - Mailbox messages remain until explicitly acknowledged. Acknowledgement hides
   them from subsequent reads; it does not delete stored records.
 - Delivery is at-least-once: a client crash after processing but before ack can
-  repeat an event. Consumers must make side effects idempotent. Waiting, a
-  WebSocket frame and the wait CLI without `--ack` never acknowledge anything.
-- Waiting requests live in memory; mail does not. If the Durable Object restarts,
-  a held request returns empty or fails, the client asks again, and the mailbox
-  answers. Hibernated WebSockets survive with their delivery cursor.
-- Each client may hold 4 waiting requests and 4 sockets; a fifth replaces the
-  oldest, so an abandoned wait cannot lock a client out. Each project is capped at
-  256 waiting requests and 1024 sockets (HTTP 429 beyond that).
+  repeat an event. Consumers must make side effects idempotent. Waiting never
+  acknowledges anything.
+- Waiting requests hold no state that matters. If the Durable Object or Worker
+  restarts, the request ends, the command asks again, and the durable mailbox
+  answers.
+- Each client may have 4 requests waiting at once and each project 256 (HTTP 429
+  beyond that; an abandoned request frees its place within 50 seconds).
 - Normal lead replies and proactive tool messages are separate. The lead is
   instructed not to send duplicate final replies or endless agent-to-agent loops.
 - External messages are not trusted instructions or approvals. Do not automatically
@@ -270,9 +274,10 @@ The `healthz` route is public; all project/lead operations require credentials.
 
 `npm test` runs actual Workers/Durable Objects tests: authorization, concurrent
 clients, idempotency, private routing, broadcast, eviction persistence, outbox
-retries, live MCP wire contracts, blocking reads, hibernating WebSockets and
-bounds. `npm run test:node` checks the stdio adapter, the wait CLI's exit codes
-against a synthetic server, and provisioning contracts. These are not claims of
+retries, live MCP wire contracts, the blocking read across hibernation, wait-token
+scope and bounds. `npm run test:node` checks the stdio adapter, runs the generated
+wait command with `sh` against a synthetic server for each exit code, and checks
+provisioning contracts. These are not claims of
 live provider interoperability.
 
 CI checks every push/PR. There is deliberately **no automatic deployment workflow**.

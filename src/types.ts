@@ -153,19 +153,54 @@ export async function rpc(
   if (!reply.ok) throw new Failure(reply.status, reply.error);
   return reply.value;
 }
-/** A wait lost to an evicted or restarted room degrades to a plain read; the mailbox is durable. */
+export type Mail = { events: Message[]; next: number };
+type Room = {
+  invoke(operation: string, args: unknown[]): Promise<any>;
+  fetch(input: string, init: RequestInit): Promise<Response>;
+};
+/**
+ * Blocking read of one client's mailbox. This stateless Worker holds the caller's request; the room only keeps a
+ * hibernatable socket and can sleep. Mail is always read through the normal authorized read, before and after.
+ */
 export async function waitRead(
-  room: { invoke(operation: string, args: unknown[]): Promise<any> },
+  room: Room,
   project: string,
   client: string,
   seconds: number,
   after: number,
-) {
-  if (!(seconds > 0)) return rpc(room, "read", project, client, after);
+): Promise<Mail> {
+  const read = () => rpc(room, "read", project, client, after);
+  const first = await read();
+  if (first.events.length || !(seconds > 0)) return first;
+  let ws: WebSocket | null = null;
   try {
-    return await rpc(room, "wait", project, client, seconds, after);
+    const response = await room.fetch("https://room/wait", {
+      headers: {
+        Upgrade: "websocket",
+        "X-Lead-Socket": JSON.stringify({ project, client, after }),
+      },
+    });
+    if (response.status === 429) throw new Failure(429, "Too many waiting requests; retry later");
+    ws = response.webSocket;
   } catch (error) {
     if (error instanceof Failure) throw error;
-    return rpc(room, "read", project, client, after);
   }
+  // No socket (the room restarted): answer from the durable mailbox; the caller asks again.
+  if (!ws) return read();
+  const socket = ws;
+  socket.accept();
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, Math.min(seconds, 50) * 1000);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    socket.addEventListener("message", done);
+    socket.addEventListener("close", done);
+    socket.addEventListener("error", done);
+  });
+  try {
+    socket.close(1000, "Done");
+  } catch {}
+  return read();
 }

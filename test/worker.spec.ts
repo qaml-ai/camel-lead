@@ -259,7 +259,7 @@ describe("project delivery", () => {
     expect(client.result.tools.map((t: any) => t.name)).toEqual([
       "message",
       "get_messages",
-      "wait_for_messages",
+      "wait_token",
       "acknowledge",
       "participants",
     ]);

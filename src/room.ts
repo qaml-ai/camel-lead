@@ -10,31 +10,19 @@ import {
 } from "./types.ts";
 import { automaticEnrollmentLimit, automaticMailboxId, explicitMailbox } from "./enrollment.ts";
 type OAuthMailbox = { id: string; userId: string; oauthClientId: string; suspended: number };
-type Waiter = { after: number; release: () => void };
-/** Survives hibernation with the socket. `sent` is the highest sequence already written to it. */
-type Socket = {
-  project: string;
-  client: string;
-  sent: number;
-  auth: "bearer" | "oauth";
-  /** The bearer hash matched at connect. A rotated credential closes the socket. */
-  key: string | null;
-  opened: number;
-};
-/** OAuth is revalidated with GitHub per request. A socket cannot do that, so it carries mail only briefly. */
-const OAUTH_SOCKET_FRESH_MS = 60_000;
+/** Survives hibernation with the socket: which mailbox it watches, and from where. */
+type Socket = { client: string; after: number };
 export const MAX_WAIT_SECONDS = 50;
 
 /** One durable mailbox/outbox per project. camelRun, not this object, owns the model loop and memory. */
 export class ProjectRoom extends DurableObject<WorkerEnv> {
-  /** Memory only. A waiter lost to eviction fails its request; the client asks again and the durable mailbox answers. */
-  private waiters = new Map<string, Set<Waiter>>();
+  limits = { clientSockets: 4, projectSockets: 256, clientTokens: 5 };
   private dirty = new Set<string>();
-  limits = { clientWaiters: 4, projectWaiters: 256, clientSockets: 4, projectSockets: 1024 };
   constructor(ctx: DurableObjectState, env: WorkerEnv) {
     super(ctx, env);
-    // Answered by the runtime without waking a hibernating object.
-    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS wait_tokens(n INTEGER PRIMARY KEY AUTOINCREMENT,hash TEXT NOT NULL UNIQUE,client TEXT NOT NULL,expires INTEGER NOT NULL)`,
+    );
     ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS oauth_mailboxes(id TEXT PRIMARY KEY,userId TEXT NOT NULL,oauthClientId TEXT NOT NULL,suspended INTEGER NOT NULL DEFAULT 0,UNIQUE(userId,oauthClientId))`,
     );
@@ -58,7 +46,8 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
         suspendOAuthUser: this.suspendOAuthUser,
         submit: this.submit,
         read: this.read,
-        wait: this.wait,
+        mintWaitToken: this.mintWaitToken,
+        waitTokenClient: this.waitTokenClient,
         ack: this.ack,
         participants: this.participants,
         send: this.send,
@@ -190,80 +179,75 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     await this.join(project, client);
     return this.pending(client, after);
   }
-  /** Blocking read: answers at once when mail exists, otherwise when mail arrives or the wait ends. */
-  async wait(project: string, client: string, seconds: number, after = 0) {
-    const first = await this.read(project, client, after);
-    if (first.events.length || !(seconds > 0)) return first;
-    let total = 0;
-    for (const set of this.waiters.values()) total += set.size;
-    if (total >= this.limits.projectWaiters)
-      throw new Failure(429, "Too many waiting requests for this project; retry later");
-    let set = this.waiters.get(client);
-    if (!set) this.waiters.set(client, (set = new Set()));
-    // An abandoned request cannot be seen from here. The newest wait wins; the oldest returns empty.
-    while (set.size >= this.limits.clientWaiters) set.values().next().value!.release();
-    const mine = set;
-    await new Promise<void>((resolve) => {
-      const waiter: Waiter = {
-        after,
-        release: () => {
-          clearTimeout(timer);
-          mine.delete(waiter);
-          resolve();
-        },
-      };
-      const timer = setTimeout(
-        waiter.release,
-        Math.min(seconds, MAX_WAIT_SECONDS) * 1000,
+  /**
+   * A narrow credential for a shell command: it can only read this client's own mailbox.
+   * Only its hash is stored. The raw value is returned once.
+   */
+  async mintWaitToken(project: string, client: string, ttlMinutes: number) {
+    await this.join(project, client);
+    const token =
+      "clw_" + Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+    const now = Date.now(),
+      expires = now + ttlMinutes * 60_000;
+    const digest = await hash(token);
+    this.ctx.storage.transactionSync(() => {
+      const sql = this.ctx.storage.sql;
+      sql.exec("DELETE FROM wait_tokens WHERE expires<=?", now);
+      sql.exec("INSERT INTO wait_tokens(hash,client,expires) VALUES(?,?,?)", digest, client, expires);
+      // Minting past the cap drops the oldest: this is also how a client rotates.
+      sql.exec(
+        "DELETE FROM wait_tokens WHERE client=? AND n NOT IN (SELECT n FROM wait_tokens WHERE client=? ORDER BY n DESC LIMIT ?)",
+        client,
+        client,
+        this.limits.clientTokens,
       );
-      mine.add(waiter);
     });
-    // Authorization and the mailbox are both checked again after the wait.
-    return this.read(project, client, after);
+    return { token, expiresAt: new Date(expires).toISOString() };
   }
-  /** Wake this client's waiting requests and sockets. Runs after the write that queued it has committed. */
+  /** The mailbox a wait token stands for. This object is one project, so another project's token is unknown here. */
+  async waitTokenClient(project: string, token: string) {
+    const refused = new Failure(401, "Invalid or expired wait token; mint a new one with the wait_token tool");
+    if (!/^clw_[A-Za-z0-9_-]{43}$/.test(token)) throw refused;
+    const row = this.ctx.storage.sql
+      .exec<{ client: string }>(
+        "SELECT client FROM wait_tokens WHERE hash=? AND expires>?",
+        await hash(token),
+        Date.now(),
+      )
+      .toArray()[0];
+    // A removed or suspended client's tokens stop working with it.
+    if (!row || !Object.hasOwn(this.clients(project), row.client)) throw refused;
+    return row.client;
+  }
+  /** Signal this client's waiting requests. Runs after the write that queued it has committed. */
   private flush() {
     const targets = [...this.dirty];
     this.dirty.clear();
-    for (const client of targets) {
-      try {
-        for (const waiter of [...(this.waiters.get(client) ?? [])])
-          if (this.pending(client, waiter.after, 1).events.length) waiter.release();
-        for (const ws of this.ctx.getWebSockets(client)) this.deliver(ws);
-      } catch {
-        // The mailbox is durable; the next read, wait or connect delivers.
-      }
-    }
+    for (const client of targets)
+      for (const ws of this.ctx.getWebSockets(client)) this.signal(ws);
   }
-  /** Internal only: the Worker authenticates, then forwards the upgrade with the server-assigned identity. */
+  /**
+   * Internal only. The Worker authenticates the caller, holds its HTTP request and parks this socket here,
+   * so this object can hibernate while requests wait. The socket carries a wake-up, never mail.
+   */
   async fetch(request: Request) {
-    const url = new URL(request.url);
-    if (
-      url.pathname !== "/ws" ||
-      request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
-    )
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket")
       return Response.json({ error: "Not found" }, { status: 404 });
-    let wanted: Partial<Socket & { after: number }> = {};
+    let wanted: Partial<Socket & { project: string }> = {};
     try {
       wanted = JSON.parse(request.headers.get("X-Lead-Socket") || "{}");
     } catch {}
-    const project = String(wanted.project || ""),
-      client = String(wanted.client || "");
+    const client = String(wanted.client || "");
     try {
-      await this.join(project, client);
+      await this.join(String(wanted.project || ""), client);
       const open = (tag?: string) =>
-        this.ctx
-          .getWebSockets(tag)
-          .filter((ws) => ws.readyState === WebSocket.OPEN);
+        this.ctx.getWebSockets(tag).filter((ws) => ws.readyState === WebSocket.OPEN);
       if (open().length >= this.limits.projectSockets)
-        throw new Failure(429, "Too many open sockets for this project; retry later");
-      const mine = open(client).sort(
-        (a, b) =>
-          ((a.deserializeAttachment() as Socket | null)?.opened ?? 0) -
-          ((b.deserializeAttachment() as Socket | null)?.opened ?? 0),
-      );
-      while (mine.length >= this.limits.clientSockets)
-        mine.shift()!.close(4008, "Replaced by a newer connection");
+        throw new Failure(429, "Too many waiting requests for this project; retry later");
+      // Refused, not replaced: waiting commands loop, and replacing one another would never settle.
+      // An abandoned wait frees its place when its request ends, at most 50 seconds later.
+      if (open(client).length >= this.limits.clientSockets)
+        throw new Failure(429, "Too many waiting requests for this client; retry later");
     } catch (error) {
       return Response.json(
         { error: error instanceof Failure ? error.message : "Project operation failed" },
@@ -272,78 +256,21 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     }
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1], [client]);
-    const attachment: Socket = {
-      project,
-      client,
-      sent: Number(wanted.after) || 0,
-      auth: wanted.auth === "oauth" ? "oauth" : "bearer",
-      key: typeof wanted.key === "string" ? wanted.key : null,
-      opened: Date.now(),
-    };
-    pair[1].serializeAttachment(attachment);
-    this.deliver(pair[1]);
+    pair[1].serializeAttachment({ client, after: Number(wanted.after) || 0 } satisfies Socket);
+    // Mail that arrived between the caller's read and this connect is not missed.
+    this.signal(pair[1]);
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
-  /** False closes the socket: the client reconnects or polls, and is authenticated again. */
-  private allowed(ws: WebSocket, a: Socket, carriesMail: boolean) {
-    let ok = false;
+  private signal(ws: WebSocket) {
     try {
-      const c = this.clients(a.project)[a.client];
-      ok = !!c && (a.auth === "oauth" || (!!a.key && c.tokenHash === a.key));
-    } catch {}
-    const stale =
-      ok && a.auth === "oauth" && carriesMail && Date.now() - a.opened > OAUTH_SOCKET_FRESH_MS;
-    if (ok && !stale) return true;
-    try {
-      // Mail is waiting, but only a request authenticated now may read it.
-      if (stale) ws.send(JSON.stringify({ type: "reauthenticate" }));
-      ws.close(4401, "Reauthenticate");
-    } catch {}
-    return false;
-  }
-  /** Write this socket's own undelivered mail. Receipt is not acknowledgement. */
-  private deliver(ws: WebSocket) {
-    const a = ws.deserializeAttachment() as Socket | null;
-    if (!a || ws.readyState !== WebSocket.OPEN) return;
-    try {
-      for (;;) {
-        const { events, next } = this.pending(a.client, a.sent);
-        if (!events.length || !this.allowed(ws, a, true)) return;
-        ws.send(JSON.stringify({ type: "messages", events, next }));
-        a.sent = next;
-        ws.serializeAttachment(a);
-      }
+      const a = ws.deserializeAttachment() as Socket | null;
+      if (a && ws.readyState === WebSocket.OPEN && this.pending(a.client, a.after, 1).events.length)
+        ws.send("mail");
     } catch {
-      try {
-        ws.close(1011, "Delivery failed");
-      } catch {}
+      // The mailbox is durable; the waiting request reads it when its time is up.
     }
   }
-  async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer) {
-    const a = ws.deserializeAttachment() as Socket | null;
-    if (!a) return ws.close(1008, "Unknown socket");
-    if (typeof data !== "string" || data.length > 1024)
-      return ws.close(1009, "Unsupported frame");
-    if (!this.allowed(ws, a, true)) return;
-    let frame: any;
-    try {
-      frame = JSON.parse(data);
-    } catch {}
-    try {
-      if (frame?.type !== "ack" || !Number.isSafeInteger(frame.seq) || frame.seq < 0)
-        throw new Failure(400, 'Expected {"type":"ack","seq":<number>}');
-      ws.send(
-        JSON.stringify({ type: "ack", ...(await this.ack(a.project, a.client, frame.seq)) }),
-      );
-    } catch (error) {
-      ws.send(
-        JSON.stringify({
-          type: "error",
-          error: error instanceof Failure ? error.message : "Project operation failed",
-        }),
-      );
-    }
-  }
+  webSocketMessage() {}
   webSocketClose(ws: WebSocket, code: number) {
     try {
       ws.close(code === 1005 || code === 1006 ? 1000 : code, "Closed");

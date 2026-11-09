@@ -13,7 +13,7 @@ The MCP server asks for `lead:messages` only; GitHub asks for `read:org` only (n
 
 GitHub tokens are retained only in the OAuth provider's encrypted grant props in KV. MCP clients receive adapter tokens, never GitHub tokens. This is not encryption against an operator controlling the running Worker. No tokens or authorization codes should be logged.
 
-Existing per-client token hashes remain supported for the stdio adapter and wait CLI; omit `tokenHash` to make a mailbox OAuth-only. Do not leave bearer credentials enabled if your policy requires GitHub membership on every request.
+Existing per-client token hashes remain supported for the stdio adapter; omit `tokenHash` to make a mailbox OAuth-only. Do not leave bearer credentials enabled if your policy requires GitHub membership on every request.
 
 ## Deployment prerequisites
 
@@ -61,7 +61,7 @@ The provider bounds each metadata body to 5 KiB and fetches to 10 seconds, verif
 
 ## Compatibility and validation
 
-Remote clients must implement MCP OAuth with PKCE, resource indicators and either CIMD or DCR. Claude Code may choose an ephemeral loopback port; the provider allows only that port to vary, keeping the registered scheme, host, path and query matched. A stable vendor CIMD URL is shared across installations: one GitHub user using two installations with the same client ID maps to the same mailbox. Use distinct client IDs if separate mailboxes are required. Nothing is pushed to a client; it calls `wait_for_messages`. The local stdio adapter and wait CLI still use configured bearer credentials; they do not yet perform the OAuth flow or refresh automatically. A WebSocket opened with an OAuth token carries mail only for its first minute; after that, arriving mail closes it with code 4401 so the next read is revalidated with GitHub.
+Remote clients must implement MCP OAuth with PKCE, resource indicators and either CIMD or DCR. Claude Code may choose an ephemeral loopback port; the provider allows only that port to vary, keeping the registered scheme, host, path and query matched. A stable vendor CIMD URL is shared across installations: one GitHub user using two installations with the same client ID maps to the same mailbox. Use distinct client IDs if separate mailboxes are required. Nothing is pushed to a client; it checks with `get_messages` or waits with the `wait_token` command. A wait token is minted by an authenticated MCP call and is not rechecked against GitHub while it lives: it is read-only, expires (8 hours by default, 24 at most) and stops working when an automatically enrolled mailbox is suspended by a failed membership check. The local stdio adapter still uses configured bearer credentials; it does not yet perform the OAuth flow or refresh automatically.
 
 Workers tests exercise CIMD without DCR, discovery, metadata/URL validation, no-redirect fetching, size limits, PKCE, refresh, exact mailbox grants and DCR, HTML escaping, consent cookie binding, upstream PKCE, callback, token exchange, project audience isolation, mailbox grants, membership removal and rate-limit failures with mocked GitHub. They do not prove a real GitHub login or native client integration. Test both with the real OAuth App before announcing sign-in as live.
 
