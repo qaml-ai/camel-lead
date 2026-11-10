@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { spawn, execFileSync } from "node:child_process";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { waitCommand } from "../src/wait-command.ts";
+import { fileTransfer } from "../src/sharing.ts";
 import {
   leadDefinition,
   leadMcpSource,
@@ -194,7 +195,7 @@ test("stdio adapter checks mail at once, mints wait tokens, and has no push chan
   await client.connect(adapter("demo"));
   assert.equal(client.getServerCapabilities()?.experimental, undefined);
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map((t) => t.name), ["join", "message", "get_messages", "wait_token", "acknowledge", "participants"]);
+  assert.deepEqual(tools.map((t) => t.name), ["join", "message", "get_messages", "wait_token", "acknowledge", "participants", "send_message", "message_status", "prepare_upload", "get_file", "list_files", "delete_file"]);
   assert.match(tools[2].description!, /^Check your mailbox now: .*To wait without checking, use wait_token\. With a session, also returns the client's shared mailbox\.$/);
   assert.match(tools[3].description!, /^Get a short-lived token .*The token can only read this client's mailbox\. With follow: true .*watch a command's output\.$/);
   assert.match(tools[4].description!, /^Mark messages handled, .*Acknowledge only after you have acted on them\.$/);
@@ -226,11 +227,39 @@ test("stdio adapter checks mail at once, mints wait tokens, and has no push chan
     { seq: 7, session: "ses_1", mailbox: "shared" },
     { session: "ses_1" },
   ]);
+  await call("send_message", { target: "bob", text: "direct", messageId: "direct", session: "ses_1" });
+  await call("message_status", { messageId: "direct_1", session: "ses_1" });
+  await call("prepare_upload", { name: "file.txt", size: 0, sha256: "0".repeat(64), session: "ses_1" });
+  await call("get_file", { fileId: "file_1", session: "ses_1" });
+  await call("list_files", { session: "ses_1" });
+  await call("delete_file", { fileId: "file_1", session: "ses_1" });
+  assert.deepEqual(fake.requests.slice(-6), [
+    "POST /projects/demo/send", "POST /projects/demo/message-status", "POST /projects/demo/prepare-upload",
+    "POST /projects/demo/get-file", "POST /projects/demo/list-files", "POST /projects/demo/delete-file",
+  ]);
+  assert.deepEqual(JSON.parse(fake.bodies.at(-6)!), { target: "bob", text: "direct", messageId: "direct", session: "ses_1", attachments: [] });
   assert.deepEqual([...new Set(fake.tokens)], ["Bearer synthetic-only"]);
   assert.equal(pushed, 0);
   // The removed channel mode fails loudly instead of silently not delivering.
   const old = new Client({ name: "test-client", version: "1" });
   await assert.rejects(old.connect(adapter("demo", "claude")));
+});
+
+test("file transfer commands quote filenames and keep credentials out of URLs", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "lead-transfer-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(join(directory, "curl"), '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o700 });
+  const file = { id: "file_1", owner: "alice", name: "a'$(touch injected).txt", size: 0, sha256: "0".repeat(64),
+    contentType: "text/plain", created: 0, expires: Date.now() + 60_000, state: "ready" as const };
+  for (const mode of ["upload", "download"] as const) {
+    const prepared = fileTransfer("https://lead.test", "demo", file, "synthetic-token", mode, "2030-01-01T00:00:00.000Z");
+    const args = execFileSync("/bin/sh", ["-c", prepared.command], { cwd: directory, env: { PATH: directory }, encoding: "utf8" }).split("\n");
+    assert.ok(args.includes("Authorization: Bearer synthetic-token"));
+    assert.ok(args.includes(mode === "upload" ? `@./${file.name}` : `./${file.name}`));
+    assert.ok(args.includes(prepared.url));
+    assert.ok(!prepared.url.includes("synthetic-token"));
+  }
+  assert.deepEqual(await readdir(directory), ["curl"]);
 });
 
 test(

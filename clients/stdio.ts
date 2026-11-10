@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { LeadClient } from "./api.ts";
 import { CLIENT_INSTRUCTIONS, TOOL_TEXT } from "../src/text.ts";
+import { registerSharingTools } from "../src/sharing.ts";
 const session = z.string().min(1).max(80).optional().describe(TOOL_TEXT.session);
 // "generic" was the old mode argument; it is still accepted so existing registrations keep working.
 const [project, mode = "generic"] = process.argv.slice(2);
@@ -92,6 +93,11 @@ server.registerTool(
   },
   async () => result(await client.call("participants")),
 );
+const sharingRoutes: Record<string, string> = {
+  send_message: "send", message_status: "message-status", prepare_upload: "prepare-upload",
+  get_file: "get-file", list_files: "list-files", delete_file: "delete-file",
+};
+registerSharingTools(server, (tool, args) => client.call(sharingRoutes[tool], args));
 let finish!: () => void;
 const closed = new Promise<void>((resolve) => {
   finish = resolve;

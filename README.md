@@ -9,6 +9,7 @@ The lead's interface is deliberately small:
 ```text
 participants()                         # people, their clients and named sessions, with ids
 send_message(target, text, messageId)   # a session id, a client id, or target="all"
+message_status(messageId)              # per-recipient delivery receipts
 ```
 
 Clients use `join`, `message`, `get_messages`, `acknowledge`, `participants` and
@@ -283,6 +284,52 @@ The REST routes used by the stdio adapter take the same optional `session`
 (`POST /projects/<project>/join` with `{ "name": ... }`, then `session` in the
 body of `messages`, `ack` (with `mailbox`) and `wait-token`, or `?session=` on
 `GET messages`).
+
+## Direct messages, delivery receipts and files
+
+Client MCPs and the stdio adapter expose `send_message` for direct communication. It accepts `target`, `text`, a
+stable `messageId`, optional sender `session`, optional `attachments` (uploaded file IDs), and optional `replyTo`
+(the incoming event ID being answered). Recipient IDs come from `participants`. Targets use the same session,
+client and `"all"` fan-out as lead messages. This path queues mailbox messages without invoking the lead model.
+The server supplies sender identity. A retry with identical content retains the original recipients, and changing
+content under the same ID is refused. Message IDs are scoped to the sender mailbox.
+
+`message_status({ messageId, session })` uses the returned server message ID and the sender session. It reports
+per-recipient `queued`, `fetched`, `acknowledged`, and `replied` timestamps, plus the reply ID. Fetched means the
+message was returned by a mailbox read, including a background wait. Acknowledged means the recipient called
+`acknowledge`. Replies are recorded when a direct message sets `replyTo` and targets the original sender. Each
+fan-out recipient has separate receipts. Delivery state survives restarts and forwarding to the shared mailbox
+when a recipient session expires. Lead-originated sends can also be inspected through the lead's `message_status`
+tool, using the original message ID. Deliveries from before this feature report `trackingAvailable: false`.
+
+File sharing uses the Worker's `FILES` R2 binding. Before deploying this configuration, create the private
+`camel-lead-files` bucket, or change `bucket_name` to your bucket. Existing mail and session data use additive SQLite
+migrations. File metadata, access grants and short-lived transfer credentials live in the project room. Object
+contents use project-prefixed R2 keys.
+For an existing lead, rerun `scripts/activate.ts` after deployment to add `message_status` to its tool allowlist.
+
+1. Compute the local file's size and SHA-256 hex digest.
+2. Call `prepare_upload({ name, size, sha256, contentType?, ttlDays?, session? })` and run the returned curl command
+   from the file's directory. The command performs a binary upload without sending file contents through MCP.
+3. Attach the returned `file.id` with `send_message({ ..., attachments: [file.id] })` after upload succeeds.
+4. Recipients call `get_file({ fileId, session? })` and run its curl command to download.
+
+`list_files({ session?, after?, limit? })` paginates accessible, completed uploads.
+`delete_file({ fileId, session? })` revokes future downloads and removes an owned object. Recipients can forward
+files they can access by attaching them to another message. Deleted or expired files cannot be newly attached.
+Already downloaded copies stay with their recipients.
+
+Uploads are immutable and checksummed, capped at 256 MiB each, with a default seven-day expiry and a one-to-365-day
+lifetime setting. Upload and download credentials last at most 15 minutes and work only for their file, project,
+and direction. They also require the originating client and session to remain authorized. Keep these credentials
+private. Metadata and downloads fail closed at expiry. The room alarm removes expired or abandoned uploads and
+retries deletion after failures. Files abandoned before upload completion are reclaimed after an hour. Physical
+cleanup runs asynchronously. File contents are untrusted input.
+
+The equivalent authenticated JSON routes are `POST send`, `POST message-status`, `POST prepare-upload`,
+`POST get-file`, `POST list-files`, and `POST delete-file` under `/projects/<project>/`. File transfer commands use
+`PUT` or `GET /projects/<project>/files/<fileId>/content` with their scoped bearer credential. A wait token cannot
+transfer files.
 
 ## Waiting for the lead
 

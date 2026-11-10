@@ -5,6 +5,7 @@ import { Failure, rpc } from "./types.ts";
 import { CLIENT_INSTRUCTIONS, TOOL_TEXT } from "./text.ts";
 import { waitCommand } from "./wait-command.ts";
 import type { ProjectRoom } from "./room.ts";
+import { fileTransfer, registerSharingTools } from "./sharing.ts";
 
 export { CLIENT_INSTRUCTIONS, TOOL_TEXT };
 const session = z.string().min(1).max(80).optional().describe(TOOL_TEXT.session);
@@ -121,6 +122,23 @@ export async function mcp(
     },
     safe(async () => rpc(room, "participants", project)),
   );
+  registerSharingTools(server, async (tool, args) => {
+    switch (tool) {
+      case "send_message": return rpc(room, "sendDirect", project, client, args);
+      case "message_status": return rpc(room, "deliveryStatus", project, client, args.messageId, args.session);
+      case "prepare_upload": {
+        const prepared = await rpc(room, "prepareUpload", project, client, args);
+        return fileTransfer(origin, project, prepared.file, prepared.token, "upload", prepared.expiresAt);
+      }
+      case "get_file": {
+        const prepared = await rpc(room, "getFile", project, client, args.fileId, args.session);
+        return fileTransfer(origin, project, prepared.file, prepared.token, "download", prepared.expiresAt);
+      }
+      case "list_files": return rpc(room, "listFiles", project, client, args.session, args.after, args.limit);
+      case "delete_file": return rpc(room, "deleteFile", project, client, args.fileId, args.session);
+      default: throw new Error("Unknown sharing tool");
+    }
+  });
   return transportResponse(request, body, server);
 }
 
@@ -196,6 +214,16 @@ export async function leadMcp(
       ],
     }),
   );
+  server.registerTool("message_status", {
+    description: "Inspect per-recipient delivery timestamps for a message sent by this lead. Use the original send_message messageId.",
+    inputSchema: { messageId: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/) },
+  }, async ({ messageId }) => {
+    try {
+      return { content: [{ type: "text" as const, text: JSON.stringify(await rpc(room, "deliveryStatus", project, null, messageId)) }] };
+    } catch {
+      return { isError: true, content: [{ type: "text" as const, text: "Unknown message." }] };
+    }
+  });
   return transportResponse(request, body, server);
 }
 

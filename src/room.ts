@@ -10,6 +10,7 @@ import {
 } from "./types.ts";
 import { automaticEnrollmentLimit, automaticMailboxId, explicitMailbox } from "./enrollment.ts";
 import { clean, clientLabel, displayName, plain, sessionName } from "./names.ts";
+import { directInput, uploadInput, type MessageDetails, type SharedFile } from "./sharing.ts";
 type OAuthMailbox = { id: string; userId: string; oauthClientId: string; suspended: number };
 /** Survives hibernation with the socket: which mailbox it watches (a client id or a session id), and from where. */
 type Socket = { client: string; after: number; shared?: string };
@@ -17,6 +18,7 @@ type Socket = { client: string; after: number; shared?: string };
 export type Profile = { login: string; name: string };
 /** A named mailbox under one client. Its id is also its mailbox id in messages, receipts and wait tokens. */
 type Session = { id: string; client: string; name: string; created: number; seen: number; notified: number };
+type StoredMessage = Omit<Message, keyof MessageDetails> & { details: string | null };
 /**
  * An authorized client: the verified person behind it (as shown, with "(@login)" when two people share a name),
  * a grouping key for that person, their plain name and GitHub login, and the client label.
@@ -71,6 +73,21 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
       ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN event TEXT");
     if (!ctx.storage.sql.exec("PRAGMA table_info(sessions)").toArray().some((c) => c.name === "notified"))
       ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN notified INTEGER NOT NULL DEFAULT 0");
+    if (!ctx.storage.sql.exec("PRAGMA table_info(messages)").toArray().some((c) => c.name === "details"))
+      ctx.storage.sql.exec("ALTER TABLE messages ADD COLUMN details TEXT");
+    if (!ctx.storage.sql.exec("PRAGMA table_info(deliveries)").toArray().some((c) => c.name === "details"))
+      ctx.storage.sql.exec("ALTER TABLE deliveries ADD COLUMN details TEXT");
+    if (!ctx.storage.sql.exec("PRAGMA table_info(deliveries)").toArray().some((c) => c.name === "owner"))
+      ctx.storage.sql.exec("ALTER TABLE deliveries ADD COLUMN owner TEXT");
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS delivery_receipts(
+      id TEXT NOT NULL,target TEXT NOT NULL,mailbox TEXT NOT NULL,queued INTEGER NOT NULL,
+      fetched INTEGER,acknowledged INTEGER,replied INTEGER,replyId TEXT,PRIMARY KEY(id,target))`);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS files(
+      id TEXT PRIMARY KEY,owner TEXT NOT NULL,name TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,
+      contentType TEXT NOT NULL,created INTEGER NOT NULL,expires INTEGER NOT NULL,state TEXT NOT NULL,cleaned INTEGER NOT NULL DEFAULT 0)`);
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS file_grants(file TEXT NOT NULL,mailbox TEXT NOT NULL,PRIMARY KEY(file,mailbox))");
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS file_tokens(
+      hash TEXT PRIMARY KEY,file TEXT NOT NULL,client TEXT NOT NULL,mailbox TEXT NOT NULL,mode TEXT NOT NULL,expires INTEGER NOT NULL)`);
   }
   async invoke(operation: string, args: unknown[]) {
     try {
@@ -88,6 +105,14 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
         ack: this.ack,
         participants: this.participants,
         send: this.send,
+        sendDirect: this.sendDirect,
+        deliveryStatus: this.deliveryStatus,
+        prepareUpload: this.prepareUpload,
+        getFile: this.getFile,
+        listFiles: this.listFiles,
+        deleteFile: this.deleteFile,
+        fileToken: this.fileToken,
+        completeUpload: this.completeUpload,
       };
       if (!Object.hasOwn(methods, operation))
         throw new Failure(404, "Unknown operation");
@@ -258,11 +283,17 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
       const ack = sql.exec<{ ack: number }>("SELECT ack FROM receipts WHERE client=?", s.id).toArray()[0]?.ack ?? 0;
       // Re-inserted, not retargeted: a new sequence number puts them after the client's own acknowledgement cursor.
       const moved = sql.exec(
-        "INSERT OR IGNORE INTO messages(id,target,text,kind,requestId,created) SELECT id,?,text,kind,requestId,created FROM messages WHERE target=? AND seq>? ORDER BY seq",
+        "INSERT OR IGNORE INTO messages(id,target,text,kind,requestId,created,details) SELECT id,?,text,kind,requestId,created,details FROM messages WHERE target=? AND seq>? ORDER BY seq",
         s.client,
         s.id,
         ack,
       ).rowsWritten;
+      sql.exec("UPDATE delivery_receipts SET mailbox=? WHERE mailbox=? AND acknowledged IS NULL", s.client, s.id);
+      sql.exec("INSERT OR IGNORE INTO file_grants(file,mailbox) SELECT file,? FROM file_grants WHERE mailbox=?", s.client, s.id);
+      sql.exec("DELETE FROM file_grants WHERE mailbox=?", s.id);
+      // Ownership follows the client when a named session retires.
+      sql.exec("UPDATE files SET owner=? WHERE owner=?", s.client, s.id);
+      sql.exec("UPDATE deliveries SET owner=? WHERE owner=?", s.client, s.id);
       sql.exec("DELETE FROM messages WHERE target=?", s.id);
       sql.exec("DELETE FROM receipts WHERE client=?", s.id);
       sql.exec("DELETE FROM wait_tokens WHERE client=?", s.id);
@@ -380,7 +411,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
         .toArray()[0]?.ack ?? 0;
     const from = Math.max(ack, after);
     const events = this.ctx.storage.sql
-      .exec<Message>(
+      .exec<StoredMessage>(
         "SELECT * FROM messages WHERE target=? AND seq>? ORDER BY seq LIMIT ?",
         client,
         from,
@@ -401,7 +432,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     const own = ack(session),
       shared = ack(client);
     const events = sql
-      .exec<Message>(
+      .exec<StoredMessage>(
         "SELECT * FROM messages WHERE ((target=? AND seq>?) OR (target=? AND seq>?)) AND seq>? ORDER BY seq LIMIT ?",
         session,
         own,
@@ -416,7 +447,16 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
   }
   async read(project: string, client: string, after = 0, session?: string | null) {
     const mailbox = await this.enter(project, client, session);
-    return mailbox === client ? this.pending(client, after) : this.pendingBoth(mailbox, client, after);
+    return this.fetched(mailbox === client ? this.pending(client, after) : this.pendingBoth(mailbox, client, after));
+  }
+  private fetched(mail: { events: StoredMessage[]; next: number }) {
+    const now = Date.now();
+    const events = mail.events.map((event) => {
+      this.ctx.storage.sql.exec("UPDATE delivery_receipts SET fetched=coalesce(fetched,?) WHERE id=? AND mailbox=?", now, event.id, event.target);
+      const { details, ...value } = event;
+      return details ? { ...value, ...JSON.parse(details) as MessageDetails } : value;
+    });
+    return { ...mail, events };
   }
   /**
    * A narrow credential for a shell command: it can only read what its minter can, this client's shared mailbox
@@ -559,6 +599,8 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
       seq,
       client,
     );
+    this.ctx.storage.sql.exec(`UPDATE delivery_receipts SET acknowledged=coalesce(acknowledged,?)
+      WHERE mailbox=? AND id IN (SELECT id FROM messages WHERE target=? AND seq<=?)`, Date.now(), client, client, seq);
     return { ack: seq, ...(acked ? { mailbox: acked } : {}) };
   }
   /** People, their clients, and each client's named sessions. Ids are what the lead's send_message accepts. */
@@ -590,11 +632,148 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     }
     return [...people.values()];
   }
-  async send(project: string, target: string, text: string, id: string) {
+  async sendDirect(project: string, client: string, input: unknown) {
+    const args = directInput.parse(input);
+    const mailbox = await this.enter(project, client, args.session);
+    const id = "direct_" + (await hash(JSON.stringify([project, mailbox, args.messageId]))).slice(0, 48);
+    const old = this.ctx.storage.sql.exec<{ details: string }>("SELECT details FROM deliveries WHERE id=?", id).toArray()[0];
+    const info = this.clients(project)[client];
+    const name = args.session ? this.sessionsOf(client).find((s) => s.id === args.session)?.name : undefined;
+    const details: MessageDetails = {
+      sender: old ? JSON.parse(old.details).sender : { id: mailbox, client, name: displayName(info.person, info.label, name) },
+      attachments: [...new Set(args.attachments)].sort(),
+      ...(args.replyTo ? { replyTo: args.replyTo } : {}),
+    };
+    // Identical retries still succeed after an attachment expires or is deleted.
+    if (!old) {
+      for (const file of details.attachments) this.accessFile(file, mailbox, client);
+      if (args.replyTo) {
+        const original = this.ctx.storage.sql.exec<{ details: string | null }>(
+          "SELECT details FROM messages WHERE id=? AND target IN (?,?)", args.replyTo, mailbox, client,
+        ).toArray()[0];
+        if (!original?.details) throw new Failure(404, "Unknown reply message");
+        const sender = (JSON.parse(original.details) as MessageDetails).sender;
+        if (args.target !== sender.id && args.target !== sender.client)
+          throw new Failure(400, "A reply must target the original sender");
+      }
+    }
+    const delivered = await this.send(project, args.target, args.text, id, details, mailbox);
+    return { messageId: id, ...delivered };
+  }
+  async deliveryStatus(project: string, client: string | null, id: string, session?: string) {
+    const owner = client === null ? null : await this.enter(project, client, session);
+    const row = this.ctx.storage.sql.exec<{ owner: string | null; target: string; recipients: string }>(
+      "SELECT owner,target,recipients FROM deliveries WHERE id=?", id,
+    ).toArray()[0];
+    if (!row || row.owner !== owner) throw new Failure(404, "Unknown message");
+    const receipts = this.ctx.storage.sql.exec<{
+      target: string; mailbox: string; queued: number; fetched: number | null;
+      acknowledged: number | null; replied: number | null; replyId: string | null;
+    }>("SELECT target,mailbox,queued,fetched,acknowledged,replied,replyId FROM delivery_receipts WHERE id=? ORDER BY target", `proactive:${id}`).toArray();
+    return { messageId: id, target: row.target, trackingAvailable: receipts.length > 0, receipts };
+  }
+  private accessFile(id: string, mailbox: string, client: string, ownerOnly = false) {
+    const file = this.ctx.storage.sql.exec<SharedFile>(
+      "SELECT id,owner,name,size,sha256,contentType,created,expires,state FROM files WHERE id=?", id,
+    ).toArray()[0];
+    const owns = file && (file.owner === mailbox || file.owner === client);
+    const granted = !ownerOnly && this.ctx.storage.sql.exec(
+      "SELECT 1 FROM file_grants WHERE file=? AND mailbox IN (?,?)", id, mailbox, client,
+    ).toArray().length;
+    if (!file || (!owns && !granted) || (!ownerOnly && (file.state !== "ready" || file.expires <= Date.now())))
+      throw new Failure(404, "Unknown or unavailable file");
+    return file;
+  }
+  private async transferToken(project: string, client: string, mailbox: string, file: SharedFile, mode: "upload" | "download") {
+    const token = "clf_" + Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+    const digest = await hash(token);
+    // Recheck after hashing, which yields to concurrent deletion or revocation.
+    await this.enter(project, client, mailbox === client ? undefined : mailbox);
+    const current = this.accessFile(file.id, mailbox, client, mode === "upload");
+    if (current.state === "deleted" || current.expires <= Date.now()) throw new Failure(404, "File unavailable");
+    this.ctx.storage.sql.exec("DELETE FROM file_tokens WHERE expires<=?", Date.now());
+    const expires = Math.min(file.expires, Date.now() + 15 * 60_000);
+    this.ctx.storage.sql.exec("INSERT INTO file_tokens(hash,file,client,mailbox,mode,expires) VALUES(?,?,?,?,?,?)",
+      digest, file.id, client, mailbox, mode, expires);
+    return { file: current, token, expiresAt: new Date(expires).toISOString() };
+  }
+  async prepareUpload(project: string, client: string, input: unknown) {
+    if (!this.env.FILES) throw new Failure(503, "File storage is not configured");
+    const args = uploadInput.parse(input);
+    const mailbox = await this.enter(project, client, args.session);
+    if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    const id = "file_" + crypto.randomUUID().replaceAll("-", "");
+    const now = Date.now();
+    this.ctx.storage.sql.exec("INSERT INTO files(id,owner,name,size,sha256,contentType,created,expires,state) VALUES(?,?,?,?,?,?,?,?,?)",
+      id, mailbox, args.name, args.size, args.sha256, args.contentType, now, now + args.ttlDays * 86400_000, "pending");
+    const file = this.accessFile(id, mailbox, client, true);
+    return this.transferToken(project, client, mailbox, file, "upload");
+  }
+  async getFile(project: string, client: string, id: string, session?: string) {
+    const mailbox = await this.enter(project, client, session);
+    return this.transferToken(project, client, mailbox, this.accessFile(id, mailbox, client), "download");
+  }
+  async listFiles(project: string, client: string, session?: string, after = "", limit = 100) {
+    const mailbox = await this.enter(project, client, session);
+    const files = this.ctx.storage.sql.exec<SharedFile>(`SELECT id,owner,name,size,sha256,contentType,created,expires,state FROM files
+      WHERE id>? AND state='ready' AND expires>? AND (owner IN (?,?) OR id IN
+      (SELECT file FROM file_grants WHERE mailbox IN (?,?))) ORDER BY id LIMIT ?`,
+      after, Date.now(), mailbox, client, mailbox, client, limit + 1).toArray();
+    return { files: files.slice(0, limit), next: files.length > limit ? files[limit - 1].id : null };
+  }
+  async deleteFile(project: string, client: string, id: string, session?: string) {
+    const mailbox = await this.enter(project, client, session);
+    const file = this.accessFile(id, mailbox, client, true);
+    if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    this.ctx.storage.sql.exec("UPDATE files SET state='deleted',expires=min(expires,?) WHERE id=?", Date.now(), id);
+    this.ctx.storage.sql.exec("DELETE FROM file_tokens WHERE file=?", id);
+    await this.env.FILES.delete(`${project}/${file.id}`);
+    return { deleted: id };
+  }
+  async fileToken(project: string, id: string, token: string, mode: "upload" | "download") {
+    if (!/^clf_[A-Za-z0-9_-]{43}$/.test(token)) throw new Failure(401, "Invalid file token");
+    const digest = await hash(token);
+    const row = this.ctx.storage.sql.exec<{ client: string; mailbox: string }>(
+      "SELECT client,mailbox FROM file_tokens WHERE hash=? AND file=? AND mode=? AND expires>?", digest, id, mode, Date.now(),
+    ).toArray()[0];
+    if (!row) throw new Failure(401, "Invalid or expired file token");
+    await this.enter(project, row.client, row.mailbox === row.client ? undefined : row.mailbox);
+    const file = this.accessFile(id, row.mailbox, row.client, mode === "upload");
+    if (file.state === "deleted" || file.expires <= Date.now()) throw new Failure(404, "File unavailable");
+    return file;
+  }
+  async completeUpload(project: string, id: string, token: string) {
+    const file = await this.fileToken(project, id, token, "upload");
+    const updated = this.ctx.storage.sql.exec(
+      "UPDATE files SET state='ready' WHERE id=? AND state!='deleted' AND expires>?", id, Date.now(),
+    ).rowsWritten;
+    if (!updated) throw new Failure(404, "File unavailable");
+    return { ...file, state: "ready" };
+  }
+  private async cleanupFiles(project: string) {
+    const now = Date.now();
+    this.ctx.storage.sql.exec("DELETE FROM file_tokens WHERE expires<=?", now);
+    const files = this.ctx.storage.sql.exec<SharedFile>(
+      "SELECT * FROM files WHERE cleaned<=? AND (state='deleted' OR expires<=? OR (state='pending' AND created<=?)) ORDER BY cleaned,id LIMIT 25",
+      now - 3600_000, now, now - 3600_000,
+    ).toArray();
+    for (const file of files) {
+      this.ctx.storage.sql.exec("UPDATE files SET state='deleted',expires=min(expires,?) WHERE id=?", now, file.id);
+      await this.env.FILES.delete(`${project}/${file.id}`);
+      this.ctx.storage.sql.exec("UPDATE files SET cleaned=? WHERE id=?", now, file.id);
+      this.ctx.storage.sql.exec("DELETE FROM file_tokens WHERE file=?", file.id);
+      this.ctx.storage.sql.exec("DELETE FROM file_grants WHERE file=?", file.id);
+      // Keep a tombstone for late uploads, and retry removal throughout that window.
+      if (file.expires < now - 86400_000) this.ctx.storage.sql.exec("DELETE FROM files WHERE id=?", file.id);
+    }
+    return files.length === 25;
+  }
+  async send(project: string, target: string, text: string, id: string, details: MessageDetails | null = null, owner: string | null = null) {
     const p = config(this.env, project);
-    const previous = this.ctx.storage.sql.exec<{ target: string; text: string; recipients: string }>("SELECT * FROM deliveries WHERE id=?", id).toArray()[0];
+    const encoded = details ? JSON.stringify(details) : null;
+    const previous = this.ctx.storage.sql.exec<{ target: string; text: string; recipients: string; details: string | null; owner: string | null }>("SELECT * FROM deliveries WHERE id=?", id).toArray()[0];
     if (previous) {
-      if (previous.target !== target || previous.text !== text) throw new Failure(409, "messageId already used for another message");
+      if (previous.target !== target || previous.text !== text || previous.details !== encoded || previous.owner !== owner) throw new Failure(409, "messageId already used for another message");
       // Freeze the original recipient set. A retry must not fan out to newly enrolled clients.
       return { deliveredToMailboxes: JSON.parse(previous.recipients) as string[] };
     }
@@ -631,9 +810,16 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     )
       throw new Failure(409, "messageId already used for another message");
     this.ctx.storage.transactionSync(() => {
-      for (const t of targets)
-        this.insert(`proactive:${id}`, t, text, "message", null);
-      this.ctx.storage.sql.exec("INSERT INTO deliveries(id,target,text,recipients) VALUES(?,?,?,?)", id, target, text, JSON.stringify(targets));
+      for (const t of targets) {
+        this.insert(`proactive:${id}`, t, text, "message", null, details);
+        this.ctx.storage.sql.exec("INSERT INTO delivery_receipts(id,target,mailbox,queued) VALUES(?,?,?,?)", `proactive:${id}`, t, t, now);
+        for (const file of details?.attachments ?? [])
+          this.ctx.storage.sql.exec("INSERT OR IGNORE INTO file_grants(file,mailbox) VALUES(?,?)", file, t);
+      }
+      this.ctx.storage.sql.exec("INSERT INTO deliveries(id,target,text,recipients,details,owner) VALUES(?,?,?,?,?,?)", id, target, text, JSON.stringify(targets), encoded, owner);
+      if (details?.replyTo) this.ctx.storage.sql.exec(
+        "UPDATE delivery_receipts SET replied=coalesce(replied,?),replyId=coalesce(replyId,?) WHERE id=? AND mailbox IN (?,?)",
+        now, `proactive:${id}`, details.replyTo, owner, details.sender.client);
     });
     return { deliveredToMailboxes: targets };
   }
@@ -643,15 +829,17 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     text: string,
     kind: string,
     requestId: string | null,
+    details: MessageDetails | null = null,
   ) {
     this.ctx.storage.sql.exec(
-      "INSERT OR IGNORE INTO messages(id,target,text,kind,requestId,created) VALUES(?,?,?,?,?,?)",
+      "INSERT OR IGNORE INTO messages(id,target,text,kind,requestId,created,details) VALUES(?,?,?,?,?,?,?)",
       id,
       target,
       text.slice(0, 16_000),
       kind,
       requestId,
       Date.now(),
+      details ? JSON.stringify(details) : null,
     );
     this.notify(target);
   }
@@ -691,6 +879,17 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     const project = await this.ctx.storage.get<string>("project");
     if (!project) return;
     const p = config(this.env, project);
+    // Arm recovery before R2 I/O. File expiry and job delivery share this room's alarm.
+    const hasFiles = this.ctx.storage.sql.exec("SELECT 1 FROM files LIMIT 1").toArray().length > 0;
+    if (hasFiles) {
+      await this.ctx.storage.setAlarm(Date.now() + 3600_000);
+      try {
+        if (await this.cleanupFiles(project)) await this.ctx.storage.setAlarm(Date.now() + 5000);
+      } catch {
+        console.error(JSON.stringify({ event: "file_cleanup_failed", project }));
+        await this.ctx.storage.setAlarm(Date.now() + 60_000);
+      }
+    }
     const jobs = this.ctx.storage.sql
       .exec<Job>(
         "SELECT * FROM jobs WHERE state IN ('queued','running') ORDER BY created LIMIT 10",

@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { verifyRuntimeToken } from "@camelai/run/server";
+import type { MessageDetails } from "./sharing.ts";
 export interface ClientConfig {
   name: string;
   tokenHash?: string;
@@ -16,7 +17,7 @@ export interface ProjectConfig {
     blockedClientIds?: string[];
   };
 }
-export type Message = {
+export type Message = Partial<MessageDetails> & {
   seq: number;
   id: string;
   target: string;

@@ -263,6 +263,12 @@ describe("project delivery", () => {
       "wait_token",
       "acknowledge",
       "participants",
+      "send_message",
+      "message_status",
+      "prepare_upload",
+      "get_file",
+      "list_files",
+      "delete_file",
     ]);
     const agent: any = await (
       await req("/agent/demo/mcp", leadToken, {
@@ -275,6 +281,7 @@ describe("project delivery", () => {
     expect(agent.result.tools.map((t: any) => t.name)).toEqual([
       "send_message",
       "participants",
+      "message_status",
     ]);
   });
   it("rejects oversized bodies and unknown recipients", async () => {

@@ -1,4 +1,5 @@
-export interface Event {
+import type { MessageDetails } from "../src/sharing.ts";
+export interface Event extends Partial<MessageDetails> {
   seq: number;
   id: string;
   text: string;

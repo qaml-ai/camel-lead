@@ -23,7 +23,7 @@ export function leadMcpSource(project: string, adapter: string) {
     name: "delivery",
     url: `${base.origin}/agent/${project}/mcp`,
     auth: { type: "runtime" as const },
-    allowTools: ["send_message", "participants"],
+    allowTools: ["send_message", "participants", "message_status"],
   };
 }
 export function memoryConfig(volumeId: string, budgetUsd: number) {

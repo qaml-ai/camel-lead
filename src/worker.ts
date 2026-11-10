@@ -12,6 +12,8 @@ import {
 } from "./types.ts";
 import { mcp, leadMcp, mintWait } from "./mcp.ts";
 import { MAX_WAIT_SECONDS } from "./room.ts";
+import { directInput, idInput, fileTransfer, uploadInput } from "./sharing.ts";
+import { transferFile } from "./files.ts";
 export { ProjectRoom } from "./room.ts";
 const optional = (v: string | null) => v ?? undefined;
 /** Longer waits are clamped, not refused. 50 s stays under the 60 s limits common in HTTP clients and proxies. */
@@ -38,8 +40,14 @@ export default {
       const authResponse = await oauthRoute(request, env, ctx);
       if (authResponse) return authResponse;
       if (url.pathname === "/healthz") return Response.json({ ok: true });
+      const transfer = /^\/projects\/([A-Za-z0-9_-]{1,80})\/files\/(file_[a-f0-9]{32})\/content$/.exec(url.pathname);
+      if (transfer) {
+        const [, project, id] = transfer;
+        config(env, project);
+        return await transferFile(request, env, env.PROJECTS.getByName(project), project, id);
+      }
       const match =
-        /^\/(projects|agent)\/([A-Za-z0-9_-]{1,80})\/(mcp|messages|ack|participants|send|wait|wait-token|join)$/.exec(
+        /^\/(projects|agent)\/([A-Za-z0-9_-]{1,80})\/(mcp|messages|ack|participants|send|wait|wait-token|join|message-status|prepare-upload|get-file|list-files|delete-file)$/.exec(
           url.pathname,
         );
       if (!match) throw new Failure(404, "Not found");
@@ -108,6 +116,29 @@ export default {
           await mintWait(room, origin(env), project, client, await boundedJson(request)),
           { headers: { "Cache-Control": "no-store" } },
         );
+      if (action === "send" && request.method === "POST")
+        return Response.json(await rpc(room, "sendDirect", project, client, directInput.parse(await boundedJson(request))), { status: 202 });
+      if (action === "message-status" && request.method === "POST") {
+        const body = z.object({ messageId: idInput, session }).parse(await boundedJson(request));
+        return Response.json(await rpc(room, "deliveryStatus", project, client, body.messageId, body.session));
+      }
+      if (action === "prepare-upload" && request.method === "POST") {
+        const prepared = await rpc(room, "prepareUpload", project, client, uploadInput.parse(await boundedJson(request)));
+        return Response.json(fileTransfer(origin(env), project, prepared.file, prepared.token, "upload", prepared.expiresAt), { headers: { "Cache-Control": "no-store" } });
+      }
+      if (action === "get-file" && request.method === "POST") {
+        const body = z.object({ fileId: idInput, session }).parse(await boundedJson(request));
+        const prepared = await rpc(room, "getFile", project, client, body.fileId, body.session);
+        return Response.json(fileTransfer(origin(env), project, prepared.file, prepared.token, "download", prepared.expiresAt), { headers: { "Cache-Control": "no-store" } });
+      }
+      if (action === "list-files" && request.method === "POST") {
+        const body = z.object({ session, after: idInput.optional(), limit: z.number().int().min(1).max(100).default(100) }).parse(await boundedJson(request));
+        return Response.json(await rpc(room, "listFiles", project, client, body.session, body.after, body.limit));
+      }
+      if (action === "delete-file" && request.method === "POST") {
+        const body = z.object({ fileId: idInput, session }).parse(await boundedJson(request));
+        return Response.json(await rpc(room, "deleteFile", project, client, body.fileId, body.session));
+      }
       if (action === "join" && request.method === "POST") {
         const body = joinBody.parse(await boundedJson(request));
         return Response.json(await rpc(room, "joinSession", project, client, body.name, body.clientInfo));
@@ -156,8 +187,8 @@ export default {
         },
         { status, headers: {
           "Cache-Control": "no-store",
-          ...(status === 401 && oauthEnabled(env) && /^\/projects\/[^/]+\/(mcp|messages|ack|participants|wait-token|join)$/.test(new URL(request.url).pathname) ? {
-            'WWW-Authenticate': `Bearer resource_metadata="${env.CAMEL_LEAD_URL}/.well-known/oauth-protected-resource${new URL(request.url).pathname.replace(/\/(messages|ack|participants|wait-token|join)$/, '/mcp')}", scope="lead:messages"`
+          ...(status === 401 && oauthEnabled(env) && /^\/projects\/[^/]+\/(mcp|messages|ack|participants|wait-token|join|send|message-status|prepare-upload|get-file|list-files|delete-file)$/.test(new URL(request.url).pathname) ? {
+            'WWW-Authenticate': `Bearer resource_metadata="${env.CAMEL_LEAD_URL}/.well-known/oauth-protected-resource${new URL(request.url).pathname.replace(/\/(messages|ack|participants|wait-token|join|send|message-status|prepare-upload|get-file|list-files|delete-file)$/, '/mcp')}", scope="lead:messages"`
           } : {}),
         } },
       );
