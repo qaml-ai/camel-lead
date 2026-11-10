@@ -4,12 +4,16 @@
   "main": "src/worker.ts",
   "compatibility_date": "2026-11-09",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
-  "workers_dev": false,
+  "workers_dev": true,
   "preview_urls": false,
   "vars": {
     "CAMELRUN_URL": "https://run-pilot.camelai.dev",
     "CAMEL_LEAD_URL": "https://camel-lead.miguel-85b.workers.dev",
+    // Public GitHub OAuth app client id. Deploying from this file must keep every binding the
+    // Worker needs: bindings added only in the dashboard are dropped by the next `wrangler deploy`.
+    "GITHUB_CLIENT_ID": "Ov23lipvVjyfJuQhHZZR",
   },
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "1ef7f5100a354c17857a45c229c9fd94" }],
   "observability": {
     "redact_query_string": true,
     "enabled": true,

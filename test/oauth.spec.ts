@@ -92,14 +92,53 @@ it('fails closed on GitHub rate limits and nonmembers', async () => {
 });
 
 async function beginCallback() {
-  const { e, params } = await fixture();
+  const { e, params, registered, verifier } = await fixture();
   const page = await call('/authorize?' + params, e);
   const handle = /name="handle" value="([^"]+)"/.exec(await page.text())![1];
   const approval = await call('/authorize', e, { method: 'POST', headers: { Cookie: cookies(page), 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ handle, decision: 'approve' }) });
   expect(approval.status).toBe(302);
   const state = new URL(approval.headers.get('location')!).searchParams.get('state');
-  return { e, callback: () => call('/oauth/callback?code=private-code&state=' + state, e, { headers: { Cookie: cookies(approval) } }) };
+  return { e, registered, verifier, callback: () => call('/oauth/callback?code=private-code&state=' + state, e, { headers: { Cookie: cookies(approval) } }) };
 }
+/**
+ * A revoked GitHub token must end the grant, not wedge the client: the request answers 401 with the
+ * protected-resource challenge, and the refresh token can no longer mint another unusable token.
+ */
+it('revokes a grant whose GitHub token is rejected and asks the client to sign in', async () => {
+  const { e, registered, verifier, callback } = await beginCallback();
+  let reject = false;
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+    const url = String(input);
+    if (url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'github-test-only', scope: 'read:org' });
+    if (url === 'https://api.github.com/user') return reject ? new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401 }) : Response.json({ id: 123 });
+    if (url.endsWith('/memberships/orgs/qaml-ai')) return Response.json({ state: 'active' });
+    throw new Error('Unexpected fetch ' + url);
+  });
+  const finished = await callback();
+  expect(finished.status).toBe(302);
+  const code = new URL(finished.headers.get('location')!).searchParams.get('code')!;
+  const issued = await (await call('/oauth/token', e, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code', client_id: registered.client_id, redirect_uri: 'http://localhost:9000/callback', code, code_verifier: verifier }) })).json<any>();
+  expect(issued.access_token).toBeTruthy();
+  reject = true;
+  const denied = await call('/projects/demo/messages', e, { headers: { Authorization: `Bearer ${issued.access_token}` } });
+  expect(denied.status).toBe(401);
+  expect(denied.headers.get('www-authenticate')).toContain('resource_metadata=');
+  const refresh = await call('/oauth/token', e, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: issued.refresh_token, client_id: registered.client_id }) });
+  expect(refresh.status).toBe(400);
+  expect(await refresh.json<any>()).toMatchObject({ error: 'invalid_grant' });
+});
+it('reports a token GitHub rejects during sign-in as a failed sign-in', async () => {
+  const { e, callback } = await beginCallback();
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+    const url = String(input);
+    if (url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'github-test-only', scope: 'read:org' });
+    if (url === 'https://api.github.com/user') return new Response('', { status: 401 });
+    throw new Error('Unexpected fetch ' + url);
+  });
+  const response = await callback();
+  expect(response.status).toBe(403);
+  expect(await response.text()).toContain('no longer valid');
+});
 it('reports GitHub exchange network failures without logging credentials', async () => {
   const { callback } = await beginCallback();
   const logs = vi.spyOn(console, 'error').mockImplementation(() => {});

@@ -61,6 +61,14 @@ async function githubJson(stage: GitHubStage, response: Response): Promise<Recor
     throw new Failure(503, 'GitHub authorization returned an invalid response. Restart sign-in from your MCP client.');
   }
 }
+/**
+ * GitHub rejected the stored user token itself (revoked, expired or otherwise unusable). Unlike a
+ * membership or permission problem, only a fresh sign-in can fix it, so the resource server answers
+ * 401 and drops the grant instead of failing the client with a permanent 403.
+ */
+export class RejectedGitHubCredential extends Failure {
+  constructor() { super(403, 'GitHub authorization no longer valid'); }
+}
 async function github(path: string, token: string) {
   const stage: GitHubStage = path === '/user' ? 'github_user' : 'github_membership';
   const response = await githubFetch(stage, `https://api.github.com${path}`, {
@@ -69,6 +77,10 @@ async function github(path: string, token: string) {
   });
   if (response.status === 429 || response.status >= 500 || (response.status === 403 && response.headers.get('x-ratelimit-remaining') === '0'))
     throw new Failure(503, 'GitHub authorization temporarily unavailable');
+  // A user token GitHub no longer accepts fails on /user with 401 ("Bad credentials").
+  if (stage === 'github_user' && response.status === 401) throw new RejectedGitHubCredential();
+  // The org membership endpoint answers 404 when there is no membership left to report.
+  if (stage === 'github_membership' && response.status === 404) throw new Failure(403, 'Active qaml-ai membership required');
   if (!response.ok) throw new Failure(403, 'GitHub authorization no longer valid');
   return githubJson(stage, response);
 }
@@ -88,6 +100,17 @@ async function resolve(env: WorkerEnv, project: string, p: ProjectConfig, userId
   await rpc(room, 'recordIdentity', project, userId, profile);
   return explicit;
 }
+/** Delete a grant and its tokens. The client's next refresh answers invalid_grant and it signs in again. */
+async function revokeGrant(env: WorkerEnv, token: string): Promise<Failure> {
+  try {
+    const oauth = server(env).getOAuthApi(env), summary = await oauth.unwrapToken(token);
+    if (summary) await oauth.revokeGrant(summary.grantId, summary.userId);
+  } catch (error) {
+    logOAuthFailure('revoke_grant', failureKind(error));
+  }
+  // 401 always carries the protected-resource challenge (see worker.ts), so the client can re-authorize.
+  return new Failure(401, 'GitHub authorization expired. Sign in again.');
+}
 export async function oauthClient(request: Request, env: WorkerEnv, project: string, p: ProjectConfig) {
   const token = /^Bearer\s+(\S+)$/i.exec(request.headers.get('authorization') || '')?.[1];
   if (!token) throw new Failure(401, 'OAuth credential required');
@@ -102,6 +125,10 @@ export async function oauthClient(request: Request, env: WorkerEnv, project: str
     // Outages/rate limits fail this request closed, but are not revocations.
     if (error instanceof Failure && error.status === 403)
       await rpc(env.PROJECTS.getByName(project), 'suspendOAuthUser', project, grant.userId);
+    // The grant can never validate again, so delete it before asking the client to sign in: a refresh
+    // would otherwise mint another access token carrying the same dead GitHub token and loop.
+    if (error instanceof RejectedGitHubCredential)
+      throw await revokeGrant(env, token);
     throw error;
   }
   if (id !== grant.props.githubUserId || id !== grant.userId) throw new Failure(403, 'GitHub identity changed');
