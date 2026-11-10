@@ -565,20 +565,24 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
   participants(project: string) {
     this.expireSessions();
     const iso = (ms?: number) => (ms ? new Date(ms).toISOString() : null);
-    const people = new Map<string, { name: string; login?: string; clients: unknown[] }>();
+    const people = new Map<string, { name: string; login?: string; status: "online" | "offline"; clients: unknown[] }>();
     for (const [id, c] of Object.entries(this.clients(project))) {
       const seen = this.ctx.storage.sql
         .exec<{ seen: number }>("SELECT seen FROM receipts WHERE client=?", id)
         .toArray()[0]?.seen;
-      const person = people.get(c.key) ?? { name: c.name, ...(c.login ? { login: c.login } : {}), clients: [] };
+      const person = people.get(c.key) ?? { name: c.name, ...(c.login ? { login: c.login } : {}), status: "offline", clients: [] };
       people.set(c.key, person);
+      const online = this.open(id).length > 0 || this.open(`shared:${id}`).length > 0;
+      if (online) person.status = "online";
       person.clients.push({
+        status: online ? "online" : "offline",
         id,
         displayName: displayName(c.person, c.label),
         lastSeen: iso(seen),
         sessions: this.sessionsOf(id).map((s) => ({
           id: s.id,
           name: s.name,
+          status: this.open(s.id).length > 0 ? "online" : "offline",
           displayName: displayName(c.person, c.label, s.name),
           lastSeen: iso(s.seen),
         })),

@@ -75,6 +75,7 @@ export default {
           q.after,
           () => rpc(room, "waitTokenRead", project, token, q.after),
           owner.session,
+          request.signal,
         );
         // 200 with mail, 204 with nothing yet: a shell loop needs only the status.
         return mail.events.length

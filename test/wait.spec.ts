@@ -1,7 +1,8 @@
 import { env, exports } from "cloudflare:workers";
-import { reset, runInDurableObject, evictDurableObject } from "cloudflare:test";
+import { reset, runInDurableObject, evictDurableObject, createExecutionContext } from "cloudflare:test";
 import { afterEach, describe, it, expect } from "vitest";
 import type { WorkerEnv } from "../src/types.ts";
+import worker from "../src/worker.ts";
 import type { ProjectRoom } from "../src/room.ts";
 declare module "cloudflare:workers" {
   interface ProvidedEnv extends WorkerEnv {}
@@ -60,6 +61,70 @@ const sockets = () =>
   runInDurableObject(room(), (_o: ProjectRoom, state) => state.getWebSockets().length);
 afterEach(async () => {
   await reset();
+});
+
+describe("participant status", () => {
+  const people = () => json("participants");
+  const open = async (session?: string) => {
+    const response = await room().fetch("https://room/wait", { headers: {
+      Upgrade: "websocket",
+      "X-Lead-Socket": JSON.stringify({ project: "demo", client: "alice", session, after: 0 }),
+    } });
+    response.webSocket!.accept();
+    return response.webSocket!;
+  };
+  const waitForStatus = async (status: string) => {
+    for (let i = 0; i < 50; i++) {
+      const list = await people();
+      if (list[0].status === status) return list;
+      await pause(20);
+    }
+    throw new Error(`Participant did not become ${status}`);
+  };
+  it("aggregates session sockets across people and clients and updates after the last disconnect", async () => {
+    const session = (await tool("join", { name: "status" })).session;
+    const other = (await tool("join", { name: "idle" })).session;
+    expect((await people())[0].status).toBe("offline");
+    const first = await open(session);
+    const second = await open(session);
+    let list = await waitForStatus("online");
+    expect(list[0].clients[0]).toMatchObject({ status: "online", sessions: [
+      { id: session, status: "online" }, { id: other, status: "offline" },
+    ] });
+    expect(list[1].status).toBe("offline");
+    await evictDurableObject(room());
+    expect((await people())[0].status).toBe("online");
+    first.close();
+    await pause(30);
+    expect((await people())[0].status).toBe("online");
+    second.close();
+    list = await waitForStatus("offline");
+    expect(list[0].clients[0].sessions[0]).toMatchObject({ id: session, status: "offline", lastSeen: expect.any(String) });
+    const shared = await open();
+    list = await waitForStatus("online");
+    expect(list[0].clients[0].status).toBe("online");
+    expect(list[0].clients[0].sessions.every((s: any) => s.status === "offline")).toBe(true);
+    shared.close();
+    await waitForStatus("offline");
+  });
+  it("closes a parked wait when the incoming HTTP request is aborted", async () => {
+    const token = await mint();
+    const controller = new AbortController();
+    const request = new Request(`https://lead.test/projects/demo/wait?timeout=50`, {
+      headers: { Authorization: `Bearer ${token}` }, signal: controller.signal,
+    });
+    const waiting = worker.fetch(request, env, createExecutionContext());
+    await waitForStatus("online");
+    controller.abort();
+    await waiting;
+    await waitForStatus("offline");
+  });
+  it("goes offline when a wait times out normally", async () => {
+    const waiting = waitFor(await mint(), "?timeout=1");
+    await waitForStatus("online");
+    await waiting;
+    await waitForStatus("offline");
+  });
 });
 
 describe("blocking mailbox read", () => {

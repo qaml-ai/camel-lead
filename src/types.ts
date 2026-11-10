@@ -175,9 +175,10 @@ export async function waitRead(
   after: number,
   read: () => Promise<Mail> = () => rpc(room, "read", project, client, after, session),
   session?: string,
+  signal?: AbortSignal,
 ): Promise<Mail> {
   const first = await read();
-  if (first.events.length || !(seconds > 0)) return first;
+  if (first.events.length || !(seconds > 0) || signal?.aborted) return first;
   let ws: WebSocket | null = null;
   try {
     const response = await room.fetch("https://room/wait", {
@@ -196,17 +197,20 @@ export async function waitRead(
   const socket = ws;
   socket.accept();
   await new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, Math.min(seconds, 50) * 1000);
+    const timer = setTimeout(() => done(), Math.min(seconds, 50) * 1000);
     const done = () => {
+      signal?.removeEventListener("abort", done);
       clearTimeout(timer);
       resolve();
     };
     socket.addEventListener("message", done);
     socket.addEventListener("close", done);
     socket.addEventListener("error", done);
+    signal?.addEventListener("abort", done, { once: true });
+    if (signal?.aborted) done();
   });
   try {
     socket.close(1000, "Done");
   } catch {}
-  return read();
+  return signal?.aborted ? first : read();
 }

@@ -256,7 +256,7 @@ describe("readable names", () => {
     await rpc(r, "submit", "auto", one, "r1", "hello", joined.session);
     expect((await runTurn("ok", "auto")).from).toEqual({ id: joined.session, name: "Miguel (@msalinas)'s Claude Code · chiridion-2" });
     // Static bearer clients have no login and are unchanged.
-    expect((await participants())[0]).toEqual({ name: "Alice", clients: [expect.objectContaining({ displayName: "Alice's agent" })] });
+    expect((await participants())[0]).toEqual({ name: "Alice", status: "offline", clients: [expect.objectContaining({ displayName: "Alice's agent" })] });
   });
   it("stores the GitHub login and name at OAuth sign-in and backfills them on later requests", async () => {
     const e: WorkerEnv = { ...env, GITHUB_CLIENT_ID: "test-github-client", GITHUB_CLIENT_SECRET: "test-github-secret" };
@@ -601,7 +601,7 @@ describe("routing", () => {
     const a = await join("chiridion-2");
     const tools = Object.fromEntries((await lead("tools/list", {})).tools.map((t: any) => [t.name, t]));
     expect(tools.participants.description).toBe(
-      "List who is connected: people, their clients and named sessions, with ids to use as send_message targets and when each was last seen.",
+      "List people, their clients and named sessions, with ids to use as send_message targets, online/offline status and last-seen times. Online means an active background message wait.",
     );
     expect(tools.send_message.inputSchema.properties.target.description).toBe('A session id, a client id, or "all".');
     const people = JSON.parse((await lead("tools/call", { name: "participants", arguments: {} })).content[0].text);
@@ -622,7 +622,7 @@ describe("compatibility", () => {
       "Name this session so the lead and other participants can tell your agents apart: the repo or task. Returns a session id for the other tools; joining again with the same name resumes that session's mailbox.",
     );
     expect(tools.participants.description).toBe(
-      "List who is connected: people, their clients and named sessions, and when each was last seen.",
+      "List people, their clients and named sessions, with online/offline status and last-seen times. Online means an active background message wait.",
     );
     for (const name of ["message", "get_messages", "acknowledge", "wait_token"]) {
       expect(tools[name].inputSchema.properties.session.description).toBe(

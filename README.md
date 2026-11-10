@@ -231,6 +231,15 @@ session: `Miguel's Claude Code · chiridion-2`.
 A client label or session name cannot contain `·` or `'s ` (they are replaced),
 so no participant can be made to read as another.
 
+`participants()` includes `status` (`online` or `offline`) for each person,
+client, and session. Online means an active background message wait. A client
+is online when its shared mailbox or any of its sessions is waiting; a person
+is online when any of their clients is online. Closing or aborting the wait
+updates status, while last-seen times and registered sessions remain available.
+Stateless tool calls alone do not keep a client online. Between long polls,
+status may briefly show offline. If a disconnect is not detected, the wait's
+50-second timeout bounds how long it can remain online.
+
 A new named session queues a `session_joined` presence event for the lead. A
 session returning after at least one hour of inactivity queues `session_returned`,
 with a one-hour notification cooldown. Repeated joins resume silently. Events

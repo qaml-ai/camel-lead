@@ -6,9 +6,9 @@ export const TOOL_TEXT = {
   session: "The session id from join. Without it, only this client's shared mailbox is used.",
   mailbox:
     'Which mailbox the messages are in, as marked on each by get_messages: "session" (the default with a session) or "shared".',
-  participants: "List who is connected: people, their clients and named sessions, and when each was last seen.",
+  participants: "List people, their clients and named sessions, with online/offline status and last-seen times. Online means an active background message wait.",
   leadParticipants:
-    "List who is connected: people, their clients and named sessions, with ids to use as send_message targets and when each was last seen.",
+    "List people, their clients and named sessions, with ids to use as send_message targets, online/offline status and last-seen times. Online means an active background message wait.",
   leadTarget: 'A session id, a client id, or "all".',
   wait_token:
     "Get a short-lived token and a shell command that waits for your next message from the lead. Run the command in the background: it exits 0 printing the messages when any arrive, 2 if none came before its timeout, 3 if the token expired (call wait_token again). The token can only read this client's mailbox. With follow: true the command keeps running and prints each batch of messages as one line, for clients that can watch a command's output.",
