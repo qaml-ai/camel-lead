@@ -19,6 +19,8 @@ export const uploadInput = z.object({
   contentType: z.string().regex(/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/).default("application/octet-stream"),
   ttlDays: z.number().int().min(1).max(365).default(7),
   session: sessionInput,
+  multipart: z.boolean().default(false),
+  partSize: z.number().int().min(5 * 1024 ** 2).max(5 * 1024 ** 3).optional(),
 });
 export type UploadInput = z.infer<typeof uploadInput>;
 export type MessageDetails = {
@@ -38,15 +40,27 @@ export type SharedFile = {
   state: "pending" | "ready" | "deleted";
 };
 
+export type MultipartStatus = {
+  uploadId: string;
+  partSize: number;
+  partCount: number;
+  parts: { partNumber: number; etag: string }[];
+};
+
 /** Shell arguments are quoted independently; filenames and tokens never become shell syntax. */
 const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
-export function fileTransfer(origin: string, project: string, file: SharedFile, token: string, mode: "upload" | "download", expiresAt: string) {
+export function fileTransfer(origin: string, project: string, file: SharedFile, token: string, mode: "upload" | "download", expiresAt: string, multipart?: MultipartStatus) {
   const url = `${origin}/projects/${project}/files/${file.id}/content`;
   const auth = `-H ${quote(`Authorization: Bearer ${token}`)}`;
   const path = quote(`./${file.name}`);
   const command = mode === "upload"
     ? `curl --fail-with-body --silent --show-error -X PUT ${auth} -H ${quote(`Content-Length: ${file.size}`)} --data-binary @${path} ${quote(url)}`
     : `curl --fail-with-body --silent --show-error ${auth} ${quote(url)} --output ${path}`;
+  if (multipart) return {
+    file, token, expiresAt, multipart,
+    partUrlTemplate: `${url}?partNumber={partNumber}`,
+    instructions: "Split the file into partSize-byte chunks. PUT each chunk to partUrlTemplate with its 1-based partNumber, Authorization: Bearer <token>, and Content-Length. Parts may upload in parallel. resume_upload returns recorded parts and a fresh token. Call complete_upload with fileId after every part succeeds. delete_file cancels the upload.",
+  };
   return { file, url, token, expiresAt, command };
 }
 
@@ -65,8 +79,18 @@ export function registerSharingTools(server: McpServer, call: (tool: string, arg
     },
     {
       name: "prepare_upload",
-      description: "Prepare an immutable file upload. Supply its filename, byte size and SHA-256 hex digest, then run the returned curl command in the file's directory. Files expire after ttlDays (default 7). The upload token is private and expires in 24 hours. Attach the returned file ID with send_message after uploading.",
+      description: "Prepare an immutable file upload. Supply its filename, byte size and SHA-256 hex digest, then follow the returned transfer instructions. Files expire after ttlDays (default 7). Set multipart=true for parallel, resumable part uploads; partSize defaults to at least 8 MiB. The upload token is private and expires in 24 hours. Attach the returned file ID with send_message after uploading.",
       schema: uploadInput,
+    },
+    {
+      name: "resume_upload",
+      description: "Resume an owned multipart upload: return a fresh 24-hour token, part size and already recorded part numbers/ETags. Upload missing parts or retry uncertain parts, then complete_upload. Supply the original sender session.",
+      schema: z.object({ fileId: idInput, session: sessionInput }),
+    },
+    {
+      name: "complete_upload",
+      description: "Finish an owned multipart upload after all parts succeed. Verifies the assembled byte size and SHA-256 before allowing attachments or downloads. Safe to retry. Supply the original sender session.",
+      schema: z.object({ fileId: idInput, session: sessionInput }),
     },
     {
       name: "get_file",

@@ -60,6 +60,13 @@ Files expire after seven days by default, with a configurable lifetime of one to
 platform's per-request body limit. Transfer commands expire after 24 hours. Direct messages and files use the existing mailbox wake-up
 flow, so the background listener receives both direct messages and lead replies.
 
+For large files or unreliable connections, set `multipart: true` in `prepare_upload`. Split the file into
+the returned `multipart.partSize` chunks and PUT them concurrently to `partUrlTemplate`, replacing
+`{partNumber}` with each 1-based part number. Send the returned bearer token and exact Content-Length.
+Use `resume_upload({ fileId, session })` to renew credentials and discover completed parts, retry missing
+parts, then call `complete_upload({ fileId, session })`. Completion verifies size and SHA-256 before
+sharing is allowed. `delete_file` cancels the upload. R2's default unfinished-upload expiry is seven days.
+
 ## Waiting without polling
 
 Call `wait_token`, then run the command it returns with the background tool your client has:

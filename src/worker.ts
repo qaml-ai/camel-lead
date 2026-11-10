@@ -47,7 +47,7 @@ export default {
         return await transferFile(request, env, env.PROJECTS.getByName(project), project, id);
       }
       const match =
-        /^\/(projects|agent)\/([A-Za-z0-9_-]{1,80})\/(mcp|messages|ack|participants|send|wait|wait-token|join|message-status|prepare-upload|get-file|list-files|delete-file)$/.exec(
+        /^\/(projects|agent)\/([A-Za-z0-9_-]{1,80})\/(mcp|messages|ack|participants|send|wait|wait-token|join|message-status|prepare-upload|resume-upload|complete-upload|get-file|list-files|delete-file)$/.exec(
           url.pathname,
         );
       if (!match) throw new Failure(404, "Not found");
@@ -124,7 +124,16 @@ export default {
       }
       if (action === "prepare-upload" && request.method === "POST") {
         const prepared = await rpc(room, "prepareUpload", project, client, uploadInput.parse(await boundedJson(request)));
-        return Response.json(fileTransfer(origin(env), project, prepared.file, prepared.token, "upload", prepared.expiresAt), { headers: { "Cache-Control": "no-store" } });
+        return Response.json(fileTransfer(origin(env), project, prepared.file, prepared.token, "upload", prepared.expiresAt, prepared.multipart), { headers: { "Cache-Control": "no-store" } });
+      }
+      if (action === "resume-upload" && request.method === "POST") {
+        const body = z.object({ fileId: idInput, session }).parse(await boundedJson(request));
+        const prepared = await rpc(room, "resumeUpload", project, client, body.fileId, body.session);
+        return Response.json(fileTransfer(origin(env), project, prepared.file, prepared.token, "upload", prepared.expiresAt, prepared.multipart), { headers: { "Cache-Control": "no-store" } });
+      }
+      if (action === "complete-upload" && request.method === "POST") {
+        const body = z.object({ fileId: idInput, session }).parse(await boundedJson(request));
+        return Response.json(await rpc(room, "completeMultipart", project, client, body.fileId, body.session));
       }
       if (action === "get-file" && request.method === "POST") {
         const body = z.object({ fileId: idInput, session }).parse(await boundedJson(request));
@@ -187,8 +196,8 @@ export default {
         },
         { status, headers: {
           "Cache-Control": "no-store",
-          ...(status === 401 && oauthEnabled(env) && /^\/projects\/[^/]+\/(mcp|messages|ack|participants|wait-token|join|send|message-status|prepare-upload|get-file|list-files|delete-file)$/.test(new URL(request.url).pathname) ? {
-            'WWW-Authenticate': `Bearer resource_metadata="${env.CAMEL_LEAD_URL}/.well-known/oauth-protected-resource${new URL(request.url).pathname.replace(/\/(messages|ack|participants|wait-token|join|send|message-status|prepare-upload|get-file|list-files|delete-file)$/, '/mcp')}", scope="lead:messages"`
+          ...(status === 401 && oauthEnabled(env) && /^\/projects\/[^/]+\/(mcp|messages|ack|participants|wait-token|join|send|message-status|prepare-upload|resume-upload|complete-upload|get-file|list-files|delete-file)$/.test(new URL(request.url).pathname) ? {
+            'WWW-Authenticate': `Bearer resource_metadata="${env.CAMEL_LEAD_URL}/.well-known/oauth-protected-resource${new URL(request.url).pathname.replace(/\/(messages|ack|participants|wait-token|join|send|message-status|prepare-upload|resume-upload|complete-upload|get-file|list-files|delete-file)$/, '/mcp')}", scope="lead:messages"`
           } : {}),
         } },
       );

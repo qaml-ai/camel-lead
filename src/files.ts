@@ -1,6 +1,6 @@
 import { Failure, rpc, type WorkerEnv } from "./types.ts";
 import type { ProjectRoom } from "./room.ts";
-import type { SharedFile } from "./sharing.ts";
+import type { SharedFile, MultipartStatus } from "./sharing.ts";
 
 /** Transfer credentials are scoped to one file and direction; normal MCP credentials cannot use this route. */
 export async function transferFile(request: Request, env: WorkerEnv, room: DurableObjectStub<ProjectRoom>, project: string, id: string) {
@@ -11,6 +11,21 @@ export async function transferFile(request: Request, env: WorkerEnv, room: Durab
   const file: SharedFile = await rpc(room, "fileToken", project, id, token, mode);
   const key = `${project}/${file.id}`;
   if (mode === "upload") {
+    const multipart: MultipartStatus | null = await rpc(room, "multipartStatus", id);
+    const partNumber = Number(new URL(request.url).searchParams.get("partNumber"));
+    if (multipart) {
+      if (file.state !== "pending") throw new Failure(409, "Upload is no longer pending");
+      if (!multipart.uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > multipart.partCount)
+        throw new Failure(400, "Valid multipart partNumber required");
+      const expected = Math.min(multipart.partSize, file.size - (partNumber - 1) * multipart.partSize);
+      const length = request.headers.get("content-length");
+      if (length === null) throw new Failure(411, "Content-Length is required");
+      if (!/^\d+$/.test(length) || Number(length) !== expected) throw new Failure(400, "Part size does not match");
+      if (!request.body) throw new Failure(400, "Part body required");
+      const part = await env.FILES.resumeMultipartUpload(key, multipart.uploadId).uploadPart(partNumber, request.body);
+      return Response.json(await rpc(room, "recordPart", project, id, token, part), { headers: { "Cache-Control": "no-store" } });
+    }
+    if (new URL(request.url).searchParams.has("partNumber")) throw new Failure(400, "Not a multipart upload");
     const length = request.headers.get("content-length");
     if (length === null) throw new Failure(411, "Content-Length is required");
     if (!/^\d+$/.test(length) || Number(length) !== file.size) throw new Failure(400, "File size does not match the prepared upload");

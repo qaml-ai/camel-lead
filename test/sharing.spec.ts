@@ -107,6 +107,61 @@ describe("direct messaging and receipts", () => {
 });
 
 describe("file sharing", () => {
+  it("uploads parallel parts, resumes after eviction and token expiry, and completes idempotently", async () => {
+    const partSize = 5 * 1024 ** 2;
+    const content = new Uint8Array(partSize * 2 + 3).fill(17);
+    const sha256 = Buffer.from(await crypto.subtle.digest("SHA-256", content)).toString("hex");
+    const prepared = await tool("prepare_upload", { name: "multipart.bin", size: content.length, sha256, multipart: true, partSize });
+    expect(prepared.multipart).toMatchObject({ partSize, partCount: 3, parts: [] });
+    const put = (info: any, number: number, body = content.slice((number - 1) * partSize, number * partSize)) => exports.default.fetch(
+      info.partUrlTemplate.replace("{partNumber}", number), {
+        method: "PUT", headers: { Authorization: `Bearer ${info.token}`, "Content-Length": String(body.length) }, body,
+      });
+    const results = await Promise.all([put(prepared, 2), put(prepared, 1)]);
+    expect(results.map(r => r.status)).toEqual([200, 200]);
+    expect((await put(prepared, 1)).status).toBe(200);
+    await expect(tool("complete_upload", { fileId: prepared.file.id })).rejects.toThrow();
+    await expect(tool("resume_upload", { fileId: prepared.file.id }, bob)).rejects.toThrow();
+    await runInDurableObject(room(), (_o: ProjectRoom, state) => { state.storage.sql.exec("UPDATE file_tokens SET expires=0"); });
+    await evictDurableObject(room());
+    expect((await put(prepared, 3)).status).toBe(401);
+    const resumed = await tool("resume_upload", { fileId: prepared.file.id });
+    expect(resumed.multipart.parts.map((p: any) => p.partNumber)).toEqual([1, 2]);
+    expect(resumed.multipart.uploadId).toBe(prepared.multipart.uploadId);
+    expect((await put(resumed, 3)).status).toBe(200);
+    // Recover the window where R2 completed but the room did not record completion.
+    const assembled = await rpc(room(), "multipartStatus", prepared.file.id);
+    await env.FILES.resumeMultipartUpload(`demo/${prepared.file.id}`, assembled.uploadId).complete(assembled.parts);
+    const completed = await Promise.all([
+      tool("complete_upload", { fileId: prepared.file.id }),
+      tool("complete_upload", { fileId: prepared.file.id }),
+    ]);
+    expect(completed.map(f => f.state)).toEqual(["ready", "ready"]);
+    expect((await tool("complete_upload", { fileId: prepared.file.id })).state).toBe("ready");
+    const download = await tool("get_file", { fileId: prepared.file.id });
+    expect(Buffer.from(await crypto.subtle.digest("SHA-256", await (await transfer(download)).arrayBuffer())).toString("hex")).toBe(sha256);
+    await tool("delete_file", { fileId: prepared.file.id });
+    expect((await transfer(download)).ok).toBe(false);
+  });
+  it("rejects malformed multipart parts and checksum mismatches, and cancels pending uploads", async () => {
+    const args = { name: "multipart.bin", size: 3, sha256: await hash("abc"), multipart: true };
+    const prepared = await tool("prepare_upload", args);
+    const put = (number: number, body: string) => transfer({ ...prepared, url: prepared.partUrlTemplate.replace("{partNumber}", number) }, "PUT", body);
+    expect((await put(0, "abc")).status).toBe(400);
+    expect((await put(2, "abc")).status).toBe(400);
+    expect((await put(1, "ab")).status).toBe(400);
+    expect((await put(1, "bad")).status).toBe(200);
+    await expect(tool("complete_upload", { fileId: prepared.file.id })).rejects.toThrow();
+    expect(await env.FILES.head(`demo/${prepared.file.id}`)).toBeNull();
+    const cancel = await tool("prepare_upload", args);
+    await tool("delete_file", { fileId: cancel.file.id });
+    await expect(tool("resume_upload", { fileId: cancel.file.id })).rejects.toThrow();
+    await tool("delete_file", { fileId: cancel.file.id });
+    const expires = await tool("prepare_upload", args);
+    await runInDurableObject(room(), (_o: ProjectRoom, state) => { state.storage.sql.exec("UPDATE files SET expires=0 WHERE id=?", expires.file.id); });
+    await runDurableObjectAlarm(room());
+    await expect(tool("resume_upload", { fileId: expires.file.id })).rejects.toThrow();
+  });
   it("issues day-long credentials and preserves unfinished uploads until file expiry", async () => {
     const before = Date.now();
     const prepared = await tool("prepare_upload", { name: "slow.txt", size: 5, sha256: await hash("hello") });

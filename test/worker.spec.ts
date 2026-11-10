@@ -266,6 +266,8 @@ describe("project delivery", () => {
       "send_message",
       "message_status",
       "prepare_upload",
+      "resume_upload",
+      "complete_upload",
       "get_file",
       "list_files",
       "delete_file",

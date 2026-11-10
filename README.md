@@ -327,8 +327,28 @@ private. Metadata and downloads fail closed at expiry. The room alarm removes ex
 retries deletion after failures. Unfinished uploads remain available until their configured file expiry. Interrupted transfers can be retried
 with the same command while its credential is valid, restarting from the beginning. Physical cleanup runs asynchronously. File contents are untrusted input.
 
+### Parallel and resumable uploads
+
+Call `prepare_upload` with `multipart: true` and the same filename, byte size and SHA-256 fields.
+The response contains a private upload token, `partUrlTemplate`, and `multipart` metadata with `partSize`,
+`partCount`, and recorded `parts`. The default part size is 8 MiB, increasing for files requiring more than
+10,000 parts. An explicit `partSize` must be between 5 MiB and 5 GiB, and each request is still subject to
+the host's request-body limit.
+
+Split the source into `partSize`-byte chunks. Replace `{partNumber}` in `partUrlTemplate` with a 1-based
+part number, then PUT that chunk with `Authorization: Bearer <token>` and its exact `Content-Length`.
+The last chunk may be shorter. Upload independent parts concurrently and retry failed parts with the
+same number. `resume_upload({ fileId, session? })` returns a fresh token and recorded parts after a
+connection loss or process restart. Retry any part whose response was lost and is absent from that list.
+
+After all parts succeed, call `complete_upload({ fileId, session? })`. Completion assembles the object
+and streams it through SHA-256 verification before marking it ready for attachments or downloads.
+Completion is retryable after a lost response. A checksum mismatch deletes the upload and requires a
+new one. `delete_file` cancels an unfinished multipart upload as well as deleting completed files.
+R2 automatically aborts unfinished multipart uploads after seven days under its default lifecycle policy.
+
 The equivalent authenticated JSON routes are `POST send`, `POST message-status`, `POST prepare-upload`,
-`POST get-file`, `POST list-files`, and `POST delete-file` under `/projects/<project>/`. File transfer commands use
+`POST resume-upload`, `POST complete-upload`, `POST get-file`, `POST list-files`, and `POST delete-file` under `/projects/<project>/`. File transfer commands use
 `PUT` or `GET /projects/<project>/files/<fileId>/content` with their scoped bearer credential. A wait token cannot
 transfer files.
 

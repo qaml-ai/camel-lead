@@ -195,7 +195,7 @@ test("stdio adapter checks mail at once, mints wait tokens, and has no push chan
   await client.connect(adapter("demo"));
   assert.equal(client.getServerCapabilities()?.experimental, undefined);
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map((t) => t.name), ["join", "message", "get_messages", "wait_token", "acknowledge", "participants", "send_message", "message_status", "prepare_upload", "get_file", "list_files", "delete_file"]);
+  assert.deepEqual(tools.map((t) => t.name), ["join", "message", "get_messages", "wait_token", "acknowledge", "participants", "send_message", "message_status", "prepare_upload", "resume_upload", "complete_upload", "get_file", "list_files", "delete_file"]);
   assert.match(tools[2].description!, /^Check your mailbox now: .*To wait without checking, use wait_token\. With a session, also returns the client's shared mailbox\.$/);
   assert.match(tools[3].description!, /^Get a short-lived token .*The token can only read this client's mailbox\. With follow: true .*watch a command's output\.$/);
   assert.match(tools[4].description!, /^Mark messages handled, .*Acknowledge only after you have acted on them\.$/);
@@ -230,14 +230,17 @@ test("stdio adapter checks mail at once, mints wait tokens, and has no push chan
   await call("send_message", { target: "bob", text: "direct", messageId: "direct", session: "ses_1" });
   await call("message_status", { messageId: "direct_1", session: "ses_1" });
   await call("prepare_upload", { name: "file.txt", size: 0, sha256: "0".repeat(64), session: "ses_1" });
+  await call("resume_upload", { fileId: "file_1", session: "ses_1" });
+  await call("complete_upload", { fileId: "file_1", session: "ses_1" });
   await call("get_file", { fileId: "file_1", session: "ses_1" });
   await call("list_files", { session: "ses_1" });
   await call("delete_file", { fileId: "file_1", session: "ses_1" });
-  assert.deepEqual(fake.requests.slice(-6), [
+  assert.deepEqual(fake.requests.slice(-8), [
     "POST /projects/demo/send", "POST /projects/demo/message-status", "POST /projects/demo/prepare-upload",
+    "POST /projects/demo/resume-upload", "POST /projects/demo/complete-upload",
     "POST /projects/demo/get-file", "POST /projects/demo/list-files", "POST /projects/demo/delete-file",
   ]);
-  assert.deepEqual(JSON.parse(fake.bodies.at(-6)!), { target: "bob", text: "direct", messageId: "direct", session: "ses_1", attachments: [] });
+  assert.deepEqual(JSON.parse(fake.bodies.at(-8)!), { target: "bob", text: "direct", messageId: "direct", session: "ses_1", attachments: [] });
   assert.deepEqual([...new Set(fake.tokens)], ["Bearer synthetic-only"]);
   assert.equal(pushed, 0);
   // The removed channel mode fails loudly instead of silently not delivering.

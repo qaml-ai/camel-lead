@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { DurableObject } from "cloudflare:workers";
 import {
   config,
@@ -10,7 +11,7 @@ import {
 } from "./types.ts";
 import { automaticEnrollmentLimit, automaticMailboxId, explicitMailbox } from "./enrollment.ts";
 import { clean, clientLabel, displayName, plain, sessionName } from "./names.ts";
-import { directInput, uploadInput, type MessageDetails, type SharedFile } from "./sharing.ts";
+import { directInput, uploadInput, type MessageDetails, type SharedFile, type MultipartStatus } from "./sharing.ts";
 type OAuthMailbox = { id: string; userId: string; oauthClientId: string; suspended: number };
 /** Survives hibernation with the socket: which mailbox it watches (a client id or a session id), and from where. */
 type Socket = { client: string; after: number; shared?: string };
@@ -86,6 +87,10 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
       id TEXT PRIMARY KEY,owner TEXT NOT NULL,name TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,
       contentType TEXT NOT NULL,created INTEGER NOT NULL,expires INTEGER NOT NULL,state TEXT NOT NULL,cleaned INTEGER NOT NULL DEFAULT 0)`);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS file_grants(file TEXT NOT NULL,mailbox TEXT NOT NULL,PRIMARY KEY(file,mailbox))");
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS file_multipart(
+      file TEXT PRIMARY KEY,uploadId TEXT,partSize INTEGER NOT NULL)`);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS file_parts(
+      file TEXT NOT NULL,partNumber INTEGER NOT NULL,etag TEXT NOT NULL,PRIMARY KEY(file,partNumber))`);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS file_tokens(
       hash TEXT PRIMARY KEY,file TEXT NOT NULL,client TEXT NOT NULL,mailbox TEXT NOT NULL,mode TEXT NOT NULL,expires INTEGER NOT NULL)`);
   }
@@ -113,6 +118,10 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
         deleteFile: this.deleteFile,
         fileToken: this.fileToken,
         completeUpload: this.completeUpload,
+        resumeUpload: this.resumeUpload,
+        multipartStatus: this.multipartStatus,
+        recordPart: this.recordPart,
+        completeMultipart: this.completeMultipart,
       };
       if (!Object.hasOwn(methods, operation))
         throw new Failure(404, "Unknown operation");
@@ -700,6 +709,9 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
   async prepareUpload(project: string, client: string, input: unknown) {
     if (!this.env.FILES) throw new Failure(503, "File storage is not configured");
     const args = uploadInput.parse(input);
+    const partSize = args.partSize ?? Math.max(8 * 1024 ** 2, Math.ceil(args.size / 10_000));
+    if (args.multipart && (args.size === 0 || partSize > 5 * 1024 ** 3 || Math.ceil(args.size / partSize) > 10_000))
+      throw new Failure(400, "Multipart uploads require 1 to 10000 parts of at most 5 GiB");
     const mailbox = await this.enter(project, client, args.session);
     if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + 60_000);
     const id = "file_" + crypto.randomUUID().replaceAll("-", "");
@@ -707,7 +719,81 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     this.ctx.storage.sql.exec("INSERT INTO files(id,owner,name,size,sha256,contentType,created,expires,state) VALUES(?,?,?,?,?,?,?,?,?)",
       id, mailbox, args.name, args.size, args.sha256, args.contentType, now, now + args.ttlDays * 86400_000, "pending");
     const file = this.accessFile(id, mailbox, client, true);
+    if (args.multipart) {
+      this.ctx.storage.sql.exec("INSERT INTO file_multipart(file,partSize) VALUES(?,?)", id, partSize);
+      return this.resumeUpload(project, client, id, args.session);
+    }
     return this.transferToken(project, client, mailbox, file, "upload");
+  }
+  async resumeUpload(project: string, client: string, id: string, session?: string) {
+    const mailbox = await this.enter(project, client, session);
+    const file = this.accessFile(id, mailbox, client, true);
+    if (file.state !== "pending" || file.expires <= Date.now()) throw new Failure(409, "Upload is no longer pending");
+    const record = this.ctx.storage.sql.exec<{ uploadId: string | null; partSize: number }>("SELECT * FROM file_multipart WHERE file=?", id).toArray()[0];
+    if (!record) throw new Failure(400, "Not a multipart upload");
+    if (!record.uploadId) {
+      const created = await this.env.FILES.createMultipartUpload(`${project}/${id}`, {
+        httpMetadata: { contentType: file.contentType }, customMetadata: { uploadFile: id },
+      });
+      try {
+        const current = this.accessFile(id, mailbox, client, true);
+        if (current.state !== "pending" || current.expires <= Date.now())
+          throw new Failure(409, "Upload is no longer pending");
+        const changed = this.ctx.storage.sql.exec("UPDATE file_multipart SET uploadId=? WHERE file=? AND uploadId IS NULL", created.uploadId, id).rowsWritten;
+        if (!changed) await created.abort();
+      } catch (error) {
+        await created.abort();
+        throw error;
+      }
+    }
+    const credentials = await this.transferToken(project, client, mailbox, file, "upload");
+    return { ...credentials, multipart: this.multipartStatus(id) };
+  }
+  multipartStatus(id: string): MultipartStatus | null {
+    const record = this.ctx.storage.sql.exec<{ uploadId: string; partSize: number; size: number }>(
+      "SELECT m.uploadId,m.partSize,f.size FROM file_multipart m JOIN files f ON f.id=m.file WHERE file=?", id,
+    ).toArray()[0];
+    if (!record) return null;
+    return { uploadId: record.uploadId, partSize: record.partSize, partCount: Math.ceil(record.size / record.partSize),
+      parts: this.ctx.storage.sql.exec<{ partNumber: number; etag: string }>("SELECT partNumber,etag FROM file_parts WHERE file=? ORDER BY partNumber", id).toArray() };
+  }
+  async recordPart(project: string, id: string, token: string, part: R2UploadedPart) {
+    const file = await this.fileToken(project, id, token, "upload");
+    if (file.state !== "pending") throw new Failure(409, "Upload is no longer pending");
+    this.ctx.storage.sql.exec("INSERT INTO file_parts(file,partNumber,etag) VALUES(?,?,?) ON CONFLICT(file,partNumber) DO UPDATE SET etag=excluded.etag", id, part.partNumber, part.etag);
+    return part;
+  }
+  async completeMultipart(project: string, client: string, id: string, session?: string) {
+    const mailbox = await this.enter(project, client, session);
+    let file = this.accessFile(id, mailbox, client, true);
+    if (file.state === "deleted" || file.expires <= Date.now()) throw new Failure(409, "Upload is no longer available");
+    if (file.state === "ready") return file;
+    const multipart = this.multipartStatus(id);
+    if (!multipart?.uploadId) throw new Failure(400, "Not a multipart upload");
+    if (multipart.parts.length !== multipart.partCount) throw new Failure(409, "Upload has missing parts");
+    const key = `${project}/${id}`;
+    // A completed R2 object survives a lost response or room restart. Retry verification safely.
+    let object = await this.env.FILES.get(key);
+    if (!object) {
+      try { await this.env.FILES.resumeMultipartUpload(key, multipart.uploadId).complete(multipart.parts); }
+      catch (error) {
+        if (!await this.env.FILES.head(key)) throw error;
+      }
+      object = await this.env.FILES.get(key);
+    }
+    if (!object || object.customMetadata?.uploadFile !== id) throw new Failure(409, "Upload object unavailable");
+    const digest = createHash("sha256");
+    let bytes = 0;
+    for await (const chunk of object.body) { digest.update(chunk); bytes += chunk.byteLength; }
+    if (bytes !== file.size || digest.digest("hex") !== file.sha256) {
+      await this.deleteFile(project, client, id, session);
+      throw new Failure(400, "Assembled file size or checksum does not match; prepare a new upload");
+    }
+    await this.enter(project, client, session);
+    file = this.accessFile(id, mailbox, client, true);
+    if (file.state === "deleted" || file.expires <= Date.now()) throw new Failure(409, "Upload is no longer available");
+    this.ctx.storage.sql.exec("UPDATE files SET state='ready' WHERE id=?", id);
+    return { ...file, state: "ready" };
   }
   async getFile(project: string, client: string, id: string, session?: string) {
     const mailbox = await this.enter(project, client, session);
@@ -727,6 +813,8 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + 60_000);
     this.ctx.storage.sql.exec("UPDATE files SET state='deleted',expires=min(expires,?) WHERE id=?", Date.now(), id);
     this.ctx.storage.sql.exec("DELETE FROM file_tokens WHERE file=?", id);
+    const multipart = this.multipartStatus(id);
+    if (multipart?.uploadId) await this.env.FILES.resumeMultipartUpload(`${project}/${id}`, multipart.uploadId).abort();
     await this.env.FILES.delete(`${project}/${file.id}`);
     return { deleted: id };
   }
@@ -759,7 +847,11 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     ).toArray();
     for (const file of files) {
       this.ctx.storage.sql.exec("UPDATE files SET state='deleted',expires=min(expires,?) WHERE id=?", now, file.id);
+      const multipart = this.multipartStatus(file.id);
+      if (multipart?.uploadId) await this.env.FILES.resumeMultipartUpload(`${project}/${file.id}`, multipart.uploadId).abort();
       await this.env.FILES.delete(`${project}/${file.id}`);
+      this.ctx.storage.sql.exec("DELETE FROM file_parts WHERE file=?", file.id);
+      this.ctx.storage.sql.exec("DELETE FROM file_multipart WHERE file=?", file.id);
       this.ctx.storage.sql.exec("UPDATE files SET cleaned=? WHERE id=?", now, file.id);
       this.ctx.storage.sql.exec("DELETE FROM file_tokens WHERE file=?", file.id);
       this.ctx.storage.sql.exec("DELETE FROM file_grants WHERE file=?", file.id);

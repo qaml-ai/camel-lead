@@ -95,7 +95,7 @@ server.registerTool(
 );
 const sharingRoutes: Record<string, string> = {
   send_message: "send", message_status: "message-status", prepare_upload: "prepare-upload",
-  get_file: "get-file", list_files: "list-files", delete_file: "delete-file",
+  resume_upload: "resume-upload", complete_upload: "complete-upload", get_file: "get-file", list_files: "list-files", delete_file: "delete-file",
 };
 registerSharingTools(server, (tool, args) => client.call(sharingRoutes[tool], args));
 let finish!: () => void;

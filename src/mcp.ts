@@ -128,8 +128,13 @@ export async function mcp(
       case "message_status": return rpc(room, "deliveryStatus", project, client, args.messageId, args.session);
       case "prepare_upload": {
         const prepared = await rpc(room, "prepareUpload", project, client, args);
-        return fileTransfer(origin, project, prepared.file, prepared.token, "upload", prepared.expiresAt);
+        return fileTransfer(origin, project, prepared.file, prepared.token, "upload", prepared.expiresAt, prepared.multipart);
       }
+      case "resume_upload": {
+        const prepared = await rpc(room, "resumeUpload", project, client, args.fileId, args.session);
+        return fileTransfer(origin, project, prepared.file, prepared.token, "upload", prepared.expiresAt, prepared.multipart);
+      }
+      case "complete_upload": return rpc(room, "completeMultipart", project, client, args.fileId, args.session);
       case "get_file": {
         const prepared = await rpc(room, "getFile", project, client, args.fileId, args.session);
         return fileTransfer(origin, project, prepared.file, prepared.token, "download", prepared.expiresAt);

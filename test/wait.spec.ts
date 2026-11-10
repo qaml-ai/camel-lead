@@ -256,7 +256,7 @@ describe("MCP tools", () => {
   it("only check at once: there is no blocking tool", async () => {
     const listed = await json("mcp", ALICE, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
     const tools = Object.fromEntries(listed.result.tools.map((t: any) => [t.name, t.description]));
-    expect(Object.keys(tools)).toEqual(["join", "message", "get_messages", "wait_token", "acknowledge", "participants", "send_message", "message_status", "prepare_upload", "get_file", "list_files", "delete_file"]);
+    expect(Object.keys(tools)).toEqual(["join", "message", "get_messages", "wait_token", "acknowledge", "participants", "send_message", "message_status", "prepare_upload", "resume_upload", "complete_upload", "get_file", "list_files", "delete_file"]);
     expect(tools.get_messages).toBe(
       "Check your mailbox now: unacknowledged replies and messages from the lead for this client (up to 50). To wait without checking, use wait_token. With a session, also returns the client's shared mailbox.",
     );
