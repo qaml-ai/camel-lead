@@ -319,8 +319,9 @@ For an existing lead, rerun `scripts/activate.ts` after deployment to add `messa
 files they can access by attaching them to another message. Deleted or expired files cannot be newly attached.
 Already downloaded copies stay with their recipients.
 
-Uploads are immutable and checksummed, capped at 256 MiB each, with a default seven-day expiry and a one-to-365-day
-lifetime setting. Upload and download credentials last at most 15 minutes and work only for their file, project,
+Uploads are immutable and checksummed, with no application-imposed file-size cap, a default seven-day expiry and
+a one-to-365-day lifetime setting. The single-request upload path remains subject to Cloudflare's request-body
+limits and R2's single-part object limit. Upload and download credentials last at most 15 minutes and work only for their file, project,
 and direction. They also require the originating client and session to remain authorized. Keep these credentials
 private. Metadata and downloads fail closed at expiry. The room alarm removes expired or abandoned uploads and
 retries deletion after failures. Files abandoned before upload completion are reclaimed after an hour. Physical

@@ -191,7 +191,7 @@ describe("file sharing", () => {
     expect(await env.FILES.head(`demo/${second.file.id}`)).toBeNull();
     expect((await tool("list_files", {})).files).toEqual([]);
   });
-  it("uses the same REST entry points and rejects malformed names and oversized files", async () => {
+  it("uses the same REST entry points, admits large files and rejects malformed input", async () => {
     const preparedResponse = await request("prepare-upload", alice, { name: "safe.txt", size: 0, sha256: await hash("") });
     expect(preparedResponse.status).toBe(200);
     const prepared = await preparedResponse.json<any>();
@@ -201,7 +201,7 @@ describe("file sharing", () => {
     expect((await request("get-file", bob, { fileId: prepared.file.id })).status).toBe(200);
     expect((await request("list-files", bob, {})).status).toBe(200);
     expect((await request("prepare-upload", alice, { name: "../x", size: 0, sha256: await hash("") })).status).toBe(400);
-    expect((await request("prepare-upload", alice, { name: "x", size: 257 * 1024 * 1024, sha256: await hash("") })).status).toBe(400);
+    expect((await request("prepare-upload", alice, { name: "x", size: 10 * 1024 * 1024 * 1024, sha256: await hash("") })).status).toBe(200);
     expect((await request("delete-file", alice, { fileId: prepared.file.id })).status).toBe(200);
     expect((await request("send", "bad", { target: "bob", text: "x", messageId: "x" })).status).toBe(401);
   });

@@ -14,7 +14,7 @@ export const directInput = z.object({
 });
 export const uploadInput = z.object({
   name: z.string().min(1).max(255).refine((name) => name !== "." && name !== ".." && name.isWellFormed() && !/[\\/\x00-\x1f\x7f]/.test(name), "Use a filename without directories or control characters"),
-  size: z.number().int().min(0).max(256 * 1024 * 1024),
+  size: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   sha256: z.string().regex(/^[a-fA-F0-9]{64}$/).transform((value) => value.toLowerCase()),
   contentType: z.string().regex(/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/).default("application/octet-stream"),
   ttlDays: z.number().int().min(1).max(365).default(7),
