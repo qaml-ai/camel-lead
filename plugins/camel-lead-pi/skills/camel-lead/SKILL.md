@@ -1,6 +1,11 @@
 ---
 name: camel-lead
-description: Work with the shared project lead (the camel-lead MCP server): name your session, tell the lead what you are doing, ask it for decisions, and wait for its messages in the background without polling. Use when the camel-lead tools (join, message, get_messages, wait_token, acknowledge, participants) are available and you are starting, coordinating, blocked on, or finishing work in a shared project.
+description: >-
+  Work with the shared project lead (the camel-lead MCP server): name your session, tell the lead
+  what you are doing, ask it for decisions, and wait for its messages in the background without
+  polling. Use when the camel-lead tools (join, message, get_messages, wait_token, acknowledge,
+  participants) are available and you are starting, coordinating, blocked on, or finishing work in
+  a shared project.
 ---
 
 # Working with the project lead

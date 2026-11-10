@@ -181,9 +181,10 @@ Pi gets both halves from one package:
 pi install /path/to/camel-lead/plugins/camel-lead-pi
 ```
 
-That registers the lead's MCP server for every session and adds the `camel-lead` skill. Then run `pi mcp login camel-lead`
-(or `/mcp` in a session) and sign in with GitHub; active members of the project's GitHub organization are enrolled
-automatically. The package lives in `plugins/camel-lead-pi` (`extensions/camel-lead.ts` and
+That registers the lead's MCP server for every session and adds the `camel-lead` skill. Then run `/mcp` in a session,
+pick `camel-lead` and sign in with GitHub; active members of the project's GitHub organization are enrolled
+automatically. Shell `pi mcp` commands do not load extensions, so they neither list nor sign in an extension-registered
+server. The package lives in `plugins/camel-lead-pi` (`extensions/camel-lead.ts` and
 `skills/camel-lead/SKILL.md`). For another deployment set
 `CAMEL_LEAD_MCP_URL=https://<your adapter>/projects/<project>/mcp` in the environment. A local path is loaded in place,
 so updating the checkout updates the package; `pi remove <the same path>` uninstalls it.
