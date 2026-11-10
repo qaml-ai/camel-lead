@@ -1,9 +1,21 @@
-import { OAuthAuthorizationServer, AuthorizationError, CimdFetchError } from '@cloudflare/workers-oauth-provider';
+import { GrantType, OAuthAuthorizationServer, OAuthError, AuthorizationError, CimdFetchError } from '@cloudflare/workers-oauth-provider';
 import { config, Failure, rpc, type ProjectConfig, type WorkerEnv } from './types.ts';
 import { explicitMailbox } from './enrollment.ts';
 
 const SCOPE = 'lead:messages';
-type Props = { githubToken: string; githubUserId: string; project: string; client: string };
+/** An adapter grant lives a year and is pushed a year out by each refresh, so a used sign-in does not expire. */
+const GRANT_TTL = 365 * 24 * 60 * 60;
+type Props = {
+  githubToken: string;
+  githubUserId: string;
+  project: string;
+  client: string;
+  /**
+   * Present when GitHub issues expiring user tokens (an OAuth App with token expiration enabled, or a
+   * GitHub App). Every adapter refresh rotates it, so the grant always carries a live GitHub token.
+   */
+  githubRefreshToken?: string;
+};
 const escape = (s: string) => s.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 export function oauthEnabled(env: WorkerEnv) {
   return !!(env.OAUTH_KV && env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET);
@@ -19,7 +31,20 @@ export function server(env: WorkerEnv) {
     scopesSupported: [SCOPE],
     clientRegistrationEndpoint: '/oauth/register',
     accessTokenTTL: 3600,
-    refreshTokenTTL: 86400,
+    refreshTokenTTL: GRANT_TTL,
+    refreshTokenIdleTTL: GRANT_TTL,
+    // Refreshing an adapter token also refreshes the upstream GitHub token it proxies. Without this a
+    // grant outlives the eight-hour token GitHub Apps and expiring OAuth Apps issue, and the client
+    // would be told to sign in again every day.
+    tokenExchangeCallback: async ({ grantType, props }) => {
+      const p = props as Props;
+      if (grantType !== GrantType.REFRESH_TOKEN || !p.githubRefreshToken) return;
+      const fresh = await refreshGitHub(env, p.githubRefreshToken);
+      const next: Props = { ...p, githubToken: fresh.token };
+      if (fresh.refreshToken) next.githubRefreshToken = fresh.refreshToken;
+      else delete next.githubRefreshToken;
+      return { newProps: next, refreshTokenIdleTTL: GRANT_TTL };
+    },
     // Requires global_fetch_strictly_public. Keep the pinned provider hardening
     // in scripts/patch-oauth-provider.mjs until the upstream fixes are released.
     clientIdMetadataDocumentEnabled: true,
@@ -30,7 +55,7 @@ export function mappedClient(p: ProjectConfig, userId: string, oauthClientId: st
   if (!client) throw new Failure(403, 'No explicit project mailbox grant for this GitHub user and MCP client');
   return client;
 }
-type GitHubStage = 'github_token' | 'github_user' | 'github_membership';
+type GitHubStage = 'github_token' | 'github_refresh' | 'github_user' | 'github_membership';
 function failureKind(error: unknown) {
   if (error instanceof Error && error.name === 'TimeoutError') return 'timeout';
   if (error instanceof Error && error.name === 'AbortError') return 'aborted';
@@ -84,6 +109,37 @@ async function github(path: string, token: string) {
   if (!response.ok) throw new Failure(403, 'GitHub authorization no longer valid');
   return githubJson(stage, response);
 }
+/**
+ * Exchange the stored GitHub refresh token for a fresh user token. GitHub rotates refresh tokens, so the
+ * caller must persist the new pair in the same step; the provider does that with `newProps`.
+ * A rejected refresh token can never recover, so it answers `invalid_grant`, which also revokes the grant.
+ */
+async function refreshGitHub(env: WorkerEnv, refreshToken: string) {
+  const unavailable = () => new OAuthError('temporarily_unavailable', { description: 'GitHub authorization temporarily unavailable', statusCode: 503 });
+  let response: Response;
+  try {
+    response = await githubFetch('github_refresh', 'https://github.com/login/oauth/access_token', {
+      method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'camel-lead' }, redirect: 'manual', signal: AbortSignal.timeout(10000),
+      body: JSON.stringify({ client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, grant_type: 'refresh_token', refresh_token: refreshToken }),
+    });
+  } catch { throw unavailable(); }
+  if (!response.ok) {
+    logOAuthFailure('github_refresh', 'unexpected_status', response.status);
+    throw unavailable();
+  }
+  let body: Record<string, unknown>;
+  try { body = await githubJson('github_refresh', response); } catch { throw unavailable(); }
+  // GitHub's token endpoint reports OAuth errors with 200 and an `error` field. Only a refresh token
+  // GitHub will not take again ends the grant; a misconfiguration must not, so it stays transient.
+  if (typeof body.error === 'string') {
+    logOAuthFailure('github_refresh', 'refused');
+    if (body.error === 'bad_refresh_token' || body.error === 'invalid_grant')
+      throw new OAuthError('invalid_grant', { description: 'GitHub authorization expired. Sign in again.' });
+    throw unavailable();
+  }
+  if (typeof body.access_token !== 'string') throw unavailable();
+  return { token: body.access_token, refreshToken: typeof body.refresh_token === 'string' ? body.refresh_token : undefined };
+}
 export async function githubIdentity(token: string) {
   const user = await github('/user', token);
   if (typeof user.id !== 'number' || !Number.isSafeInteger(user.id) || user.id <= 0) throw new Failure(403, 'Invalid GitHub identity');
@@ -127,8 +183,12 @@ export async function oauthClient(request: Request, env: WorkerEnv, project: str
       await rpc(env.PROJECTS.getByName(project), 'suspendOAuthUser', project, grant.userId);
     // The grant can never validate again, so delete it before asking the client to sign in: a refresh
     // would otherwise mint another access token carrying the same dead GitHub token and loop.
-    if (error instanceof RejectedGitHubCredential)
+    if (error instanceof RejectedGitHubCredential) {
+      // A stored GitHub refresh token makes this recoverable: answer 401 so the client refreshes its
+      // adapter token, and `tokenExchangeCallback` rotates the rejected GitHub token first.
+      if (grant.props.githubRefreshToken) throw new Failure(401, 'GitHub authorization expired. Refresh the OAuth credential.');
       throw await revokeGrant(env, token);
+    }
     throw error;
   }
   if (id !== grant.props.githubUserId || id !== grant.userId) throw new Failure(403, 'GitHub identity changed');
@@ -190,7 +250,12 @@ export async function oauthRoute(request: Request, env: WorkerEnv, ctx: Executio
       if (!project) throw new Failure(403, 'Unknown project resource');
       const client = await resolve(env, project, config(env, project), userId, original.clientId, true, profile);
       callbackStage = 'issue_authorization';
-      const { redirectTo } = await oauth.completeAuthorization({ request: original, userId, metadata: { project, client }, scope: [SCOPE], props: { githubToken: upstream.access_token, githubUserId: userId, project, client }, revokeExistingGrants: false });
+      const props: Props = {
+        githubToken: upstream.access_token, githubUserId: userId, project, client,
+        // Present only when GitHub issues expiring user tokens; kept encrypted with the grant.
+        ...(typeof upstream.refresh_token === 'string' ? { githubRefreshToken: upstream.refresh_token } : {}),
+      };
+      const { redirectTo } = await oauth.completeAuthorization({ request: original, userId, metadata: { project, client }, scope: [SCOPE], props, revokeExistingGrants: false });
       headers.set('Location', redirectTo);
       return new Response(null, { status: 302, headers });
     }

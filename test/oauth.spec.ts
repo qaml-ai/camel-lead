@@ -201,3 +201,79 @@ it('rejects GitHub identity redirects without forwarding the bearer token', asyn
   await expect(githubIdentity('private-token')).rejects.toMatchObject({ status: 403 });
   expect(outbound).toHaveBeenCalledTimes(1);
 });
+
+/** A GitHub that issues expiring user tokens, like a GitHub App or an OAuth App with token expiration. */
+function expiringGitHub() {
+  const valid = new Set(['gh-1']);
+  let refreshToken = 'ghr-1';
+  let next = 2;
+  const rotations: string[] = [];
+  let refuseRefresh = false;
+  const mock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: RequestInit) => {
+    const url = String(input);
+    const authorization = new Headers(init?.headers).get('authorization');
+    if (url === 'https://github.com/login/oauth/access_token') {
+      const body = JSON.parse(String(init?.body));
+      if (body.grant_type !== 'refresh_token')
+        return Response.json({ access_token: 'gh-1', scope: 'read:org', expires_in: 28800, refresh_token: refreshToken });
+      rotations.push(String(body.refresh_token));
+      expect(body.client_id).toBe('test-github-client');
+      if (refuseRefresh || body.refresh_token !== refreshToken)
+        return Response.json({ error: 'bad_refresh_token', error_description: 'private-upstream-detail' });
+      const token = `gh-${next++}`;
+      refreshToken = `ghr-${next}`;
+      valid.add(token);
+      return Response.json({ access_token: token, scope: 'read:org', expires_in: 28800, refresh_token: refreshToken });
+    }
+    if (url === 'https://api.github.com/user')
+      return valid.has((authorization || '').replace(/^Bearer /, '')) ? Response.json({ id: 123 }) : new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401 });
+    if (url.endsWith('/memberships/orgs/qaml-ai')) return Response.json({ state: 'active' });
+    throw new Error('Unexpected fetch ' + url);
+  });
+  return {
+    mock, rotations,
+    /** Expire every user token GitHub has issued so far, as eight hours passing would. */
+    expire: () => valid.clear(),
+    refuseRefresh: () => { refuseRefresh = true; },
+  };
+}
+/** Complete sign-in with the expiring GitHub and return the adapter token, its expiry and a caller. */
+async function signInToExpiringGitHub() {
+  const { e, registered, verifier, callback } = await beginCallback();
+  const github = expiringGitHub();
+  const finished = await callback();
+  expect(finished.status).toBe(302);
+  const code = new URL(finished.headers.get('location')!).searchParams.get('code')!;
+  const tokenReply = await call('/oauth/token', e, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code', client_id: registered.client_id, redirect_uri: 'http://localhost:9000/callback', code, code_verifier: verifier }) });
+  expect(tokenReply.status).toBe(200);
+  const issued = await tokenReply.json<any>();
+  const read = (access: string) => call('/projects/demo/messages', e, { headers: { Authorization: `Bearer ${access}` } });
+  const refresh = (token: string) => call('/oauth/token', e, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: token, client_id: registered.client_id }) });
+  return { e, github, issued, read, refresh };
+}
+it('rotates the GitHub token on refresh instead of ending the grant every eight hours', async () => {
+  const { github, issued, read, refresh } = await signInToExpiringGitHub();
+  expect((await read(issued.access_token)).status).toBe(200);
+  github.expire();
+  // A rejected GitHub token is a recoverable 401, not a permanent 403 and not a revoked grant.
+  expect((await read(issued.access_token)).status).toBe(401);
+  const turned = await refresh(issued.refresh_token);
+  expect(turned.status).toBe(200);
+  expect(github.rotations).toEqual(['ghr-1']);
+  const next = await turned.json<any>();
+  expect(next.refresh_token).toBeTruthy();
+  expect((await read(next.access_token)).status).toBe(200);
+});
+it('ends the grant when GitHub refuses to refresh the user token', async () => {
+  const { e, github, issued, read, refresh } = await signInToExpiringGitHub();
+  const grants = async () => ((await e.OAUTH_KV.list({ prefix: 'grant:123:' })).keys).length;
+  const before = await grants();
+  github.expire();
+  github.refuseRefresh();
+  expect((await read(issued.access_token)).status).toBe(401);
+  const denied = await refresh(issued.refresh_token);
+  expect(denied.status).toBe(400);
+  expect(await denied.text()).not.toContain('private-upstream-detail');
+  expect(await (await refresh(issued.refresh_token)).text()).toContain('invalid_grant');
+  expect(await grants()).toBe(before - 1);
+});
