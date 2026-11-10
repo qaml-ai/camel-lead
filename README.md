@@ -231,6 +231,13 @@ session: `Miguel's Claude Code · chiridion-2`.
 A client label or session name cannot contain `·` or `'s ` (they are replaced),
 so no participant can be made to read as another.
 
+A new named session queues a `session_joined` presence event for the lead. A
+session returning after at least one hour of inactivity queues `session_returned`,
+with a one-hour notification cooldown. Repeated joins resume silently. Events
+include the person, client, session name, and reply target, and use the durable
+message queue with retries. The lead may reply to the joining session. Silent
+completion creates no mailbox message. Presence events can incur model usage.
+
 `join({ name })` creates or resumes a named session under the calling client and
 returns `{ session, displayName }`. The name is 1 to 40 printable characters on
 one line: the repository or task. Joining again with the same name returns the

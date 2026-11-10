@@ -16,7 +16,7 @@ type Socket = { client: string; after: number; shared?: string };
 /** A verified GitHub profile. Only the Worker, after checking the identity with GitHub, passes one in. */
 export type Profile = { login: string; name: string };
 /** A named mailbox under one client. Its id is also its mailbox id in messages, receipts and wait tokens. */
-type Session = { id: string; client: string; name: string; created: number; seen: number };
+type Session = { id: string; client: string; name: string; created: number; seen: number; notified: number };
 /**
  * An authorized client: the verified person behind it (as shown, with "(@login)" when two people share a name),
  * a grouping key for that person, their plain name and GitHub login, and the client label.
@@ -67,6 +67,10 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     );
     if (!ctx.storage.sql.exec("PRAGMA table_info(jobs)").toArray().some((c) => c.name === "session"))
       ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN session TEXT");
+    if (!ctx.storage.sql.exec("PRAGMA table_info(jobs)").toArray().some((c) => c.name === "event"))
+      ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN event TEXT");
+    if (!ctx.storage.sql.exec("PRAGMA table_info(sessions)").toArray().some((c) => c.name === "notified"))
+      ctx.storage.sql.exec("ALTER TABLE sessions ADD COLUMN notified INTEGER NOT NULL DEFAULT 0");
   }
   async invoke(operation: string, args: unknown[]) {
     try {
@@ -290,24 +294,43 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     const id = "ses_" + (await hash(JSON.stringify([project, client, name]))).slice(0, 40);
     const known = this.clients(project);
     if (Object.hasOwn(known, id)) throw new Failure(409, "Session name conflicts with a configured client");
+    // Arm delivery before atomically writing the session and its event.
+    if ((await this.ctx.storage.getAlarm()) === null)
+      await this.ctx.storage.setAlarm(Date.now() + 1000);
     const now = Date.now(),
       sql = this.ctx.storage.sql;
     this.expireSessions(now);
-    if (sql.exec("SELECT 1 FROM sessions WHERE id=?", id).toArray().length)
-      sql.exec("UPDATE sessions SET seen=? WHERE id=?", now, id);
-    else {
-      const all = sql.exec<Session>("SELECT * FROM sessions WHERE client=? ORDER BY seen", client).toArray();
-      if (all.length >= MAX_SESSIONS) {
-        // Room is made by ending the longest-idle session: never one seen in the last day or waiting right now.
-        const idle = all.find((s) => s.seen <= now - SESSION_IDLE_MS && !this.open(s.id).length);
-        if (!idle)
-          throw new Failure(429, `This client already has ${MAX_SESSIONS} live sessions; join one of them by name`);
-        this.retire(idle);
+    const display = displayName(known[client].person, known[client].label, name);
+    this.ctx.storage.transactionSync(() => {
+      const previous = sql.exec<Session>("SELECT * FROM sessions WHERE id=?", id).toArray()[0];
+      const event = !previous ? "session_joined"
+        : previous.seen <= now - SESSION_LIVE_MS && previous.notified <= now - SESSION_LIVE_MS
+          ? "session_returned" : null;
+      if (event && sql.exec<{ n: number }>("SELECT count(*) AS n FROM jobs WHERE state IN ('queued','running')").one().n >= 100)
+        throw new Failure(429, "Project queue full; retry later");
+      if (previous)
+        sql.exec("UPDATE sessions SET seen=? WHERE id=?", now, id);
+      else {
+        const all = sql.exec<Session>("SELECT * FROM sessions WHERE client=? ORDER BY seen", client).toArray();
+        if (all.length >= MAX_SESSIONS) {
+          // Never retire a session seen in the last day or waiting right now.
+          const idle = all.find((s) => s.seen <= now - SESSION_IDLE_MS && !this.open(s.id).length);
+          if (!idle)
+            throw new Failure(429, `This client already has ${MAX_SESSIONS} live sessions; join one of them by name`);
+          this.retire(idle);
+        }
+        sql.exec("INSERT INTO sessions(id,client,name,created,seen) VALUES(?,?,?,?,?)", id, client, name, now, now);
       }
-      sql.exec("INSERT INTO sessions(id,client,name,created,seen) VALUES(?,?,?,?,?)", id, client, name, now, now);
-    }
-    this.touch(id, now);
-    return { session: id, displayName: displayName(known[client].person, known[client].label, name) };
+      if (event) {
+        const text = JSON.stringify({ event, person: known[client].person, client: known[client].label,
+          session: name, displayName: display, replyTarget: id });
+        sql.exec("INSERT INTO jobs(id,client,text,state,created,session,event) VALUES(?,?,?,?,?,?,?)",
+          `presence_${crypto.randomUUID()}`, client, text, "queued", now, id, event);
+        sql.exec("UPDATE sessions SET notified=? WHERE id=?", now, id);
+      }
+      this.touch(id, now);
+    });
+    return { session: id, displayName: display };
   }
   async submit(
     project: string,
@@ -689,7 +712,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
               requestId: job.id,
               // The lead sees who is speaking, and from.id is a valid send_message target.
               from: { id: session?.id ?? job.client, name: displayName(client.person, client.label, session?.name) },
-              metadata: { source: "camel-lead", client: job.client, project, ...(session ? { session: session.id } : {}) },
+              metadata: { source: "camel-lead", client: job.client, project, ...(session ? { session: session.id } : {}), ...(job.event ? { event: job.event } : {}) },
             },
           );
           this.ctx.storage.sql.exec(
@@ -714,7 +737,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
           // Policy may have changed or a revocation may have been observed during network I/O.
           if (!Object.hasOwn(this.clients(project), job.client)) throw new Failure(403, "Client access revoked");
           this.ctx.storage.transactionSync(() => {
-            this.insert(
+            if (!job.event || r.reply || outcome.error || r.error || r.stopped === "input_required") this.insert(
               `reply:${job.id}`,
               this.replyBox(job),
               text,

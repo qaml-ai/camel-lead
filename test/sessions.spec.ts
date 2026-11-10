@@ -66,7 +66,9 @@ const waitFor = async (token: string, query = "?timeout=0") => {
 async function runTurn(reply: string, project = "demo") {
   const prompts: any[] = [];
   const mock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any) => {
-    prompts.push(await (input as Request).json());
+    const prompt = await (input as Request).json();
+    if (prompt.metadata.event) return Response.json({ state: "completed", outcome: { result: {} } });
+    prompts.push(prompt);
     return Response.json({ state: "completed", outcome: { result: { reply } } });
   });
   await runDurableObjectAlarm(room(project));
@@ -77,6 +79,83 @@ async function runTurn(reply: string, project = "demo") {
 afterEach(async () => {
   vi.restoreAllMocks();
   await reset();
+});
+
+describe("presence", () => {
+  it("queues one event for concurrent joins and delivers identity and a routable reply target", async () => {
+    const sessions = await Promise.all(Array.from({ length: 5 }, () =>
+      json("join", ALICE, { name: "presence-test", clientInfo: { name: "codex", version: "1" } })));
+    const id = sessions[0].session;
+    expect(sessions.every((s) => s.session === id)).toBe(true);
+    expect(await sql("SELECT event FROM jobs")).toEqual([{ event: "session_joined" }]);
+    const prompts: any[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any) => {
+      prompts.push(await (input as Request).json());
+      return Response.json({ state: "completed", outcome: { result: { reply: "Welcome!" } } });
+    });
+    await runDurableObjectAlarm(room());
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0].metadata).toEqual({ source: "camel-lead", client: "alice", project: "demo", session: id, event: "session_joined" });
+    expect(prompts[0].from).toEqual({ id, name: "Alice's Codex · presence-test" });
+    expect(JSON.parse(prompts[0].text)).toEqual({ event: "session_joined", person: "Alice", client: "Codex",
+      session: "presence-test", displayName: "Alice's Codex · presence-test", replyTarget: id });
+    expect(await mailbox(id)).toEqual(["Welcome!"]);
+    expect(await mailbox(undefined, BOB)).toEqual([]);
+  });
+  it("persists deduplication across eviction and applies inactivity and notification cooldowns", async () => {
+    const id = await join("returning");
+    await evictDurableObject(room());
+    expect(await join("returning")).toBe(id);
+    expect(await sql("SELECT event FROM jobs")).toHaveLength(1);
+    await age(id, HOUR + 1);
+    await join("returning"); // Recently notified, even though last seen was older.
+    expect(await sql("SELECT event FROM jobs")).toHaveLength(1);
+    await sql("UPDATE sessions SET notified=? WHERE id=?", Date.now() - HOUR - 1, id);
+    await join("returning"); // Recently seen, even though last notified was older.
+    expect(await sql("SELECT event FROM jobs")).toHaveLength(1);
+    await age(id, HOUR + 1);
+    await join("returning");
+    await join("returning");
+    expect(await sql("SELECT event FROM jobs ORDER BY created")).toEqual([{ event: "session_joined" }, { event: "session_returned" }]);
+  });
+  it("retries with the same runtime request id and permits silent completion", async () => {
+    const id = await join("retry");
+    const requests: string[] = [];
+    let fail = true;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any) => {
+      requests.push((await (input as Request).json()).requestId);
+      if (fail) throw new Error("temporary outage");
+      return Response.json({ state: "completed", outcome: { result: {} } });
+    });
+    await runDurableObjectAlarm(room());
+    await join("retry");
+    fail = false;
+    await runDurableObjectAlarm(room());
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toBe(requests[0]);
+    expect(await sql("SELECT state,attempts FROM jobs")).toEqual([{ state: "done", attempts: 1 }]);
+    expect(await mailbox(id)).toEqual([]);
+  });
+  it("leaves a rejected join retryable when the queue is full", async () => {
+    for (let n = 0; n < 100; n++)
+      await sql("INSERT INTO jobs(id,client,text,state,created) VALUES(?,'alice','busy','queued',1)", `busy-${n}`);
+    expect((await req("join", ALICE, { name: "full" })).status).toBe(429);
+    expect(await sql("SELECT * FROM sessions")).toEqual([]);
+    await sql("DELETE FROM jobs");
+    await join("full");
+    expect(await sql("SELECT event FROM jobs")).toEqual([{ event: "session_joined" }]);
+  });
+  it("upgrades existing sessions without alerting on an active reconnect", async () => {
+    const id = await join("old");
+    await sql("DELETE FROM jobs");
+    await sql("ALTER TABLE sessions DROP COLUMN notified");
+    await evictDurableObject(room());
+    expect(await join("old")).toBe(id);
+    expect(await sql("SELECT * FROM jobs")).toEqual([]);
+    await age(id, HOUR + 1);
+    await join("old");
+    expect(await sql("SELECT event FROM jobs")).toEqual([{ event: "session_returned" }]);
+  });
 });
 
 describe("readable names", () => {
@@ -343,7 +422,7 @@ describe("session mailboxes", () => {
     expect((await req("messages", ALICE, { text: "x", requestId: "x", session: bobs })).status).toBe(404);
     expect((await req("ack", ALICE, { seq: 1, session: bobs })).status).toBe(404);
     expect((await req("wait-token", ALICE, { session: bobs })).status).toBe(404);
-    expect(await sql("SELECT count(*) AS n FROM jobs")).toEqual([{ n: 0 }]);
+    expect(await sql("SELECT count(*) AS n FROM jobs WHERE event IS NULL")).toEqual([{ n: 0 }]);
     // A session's id from another project's room means nothing here.
     const elsewhere = (await rpc(room("other"), "joinSession", "other", "alice", "repo-a")).session;
     expect((await req(`messages?session=${elsewhere}`)).status).toBe(404);
@@ -568,7 +647,7 @@ describe("compatibility", () => {
     const prompt = await runTurn("Plain reply");
     expect(prompt.from).toEqual({ id: "alice", name: "Alice's agent" });
     expect(prompt.metadata).toEqual({ source: "camel-lead", client: "alice", project: "demo" });
-    expect(await sql("SELECT client,session FROM jobs")).toEqual([{ client: "alice", session: null }]);
+    expect(await sql("SELECT client,session FROM jobs WHERE event IS NULL")).toEqual([{ client: "alice", session: null }]);
     expect(await send("alice", "Proactive")).toEqual(["alice"]);
     const mail = await tool("get_messages", {});
     expect(texts(mail)).toEqual(["Plain reply", "Proactive"]);
@@ -602,7 +681,7 @@ describe("compatibility", () => {
     const columns = await runInDurableObject(room("auto"), (_o: ProjectRoom, s) =>
       s.storage.sql.exec("PRAGMA table_info(jobs)").toArray().map((c) => c.name),
     );
-    expect(columns).toEqual(["id", "client", "text", "state", "attempts", "created", "session"]);
+    expect(columns).toEqual(["id", "client", "text", "state", "attempts", "created", "session", "event"]);
     // Opening it again changes nothing.
     await evictDurableObject(room("auto"));
     // Old mail, the old wait token and the old queued job all keep working; the old enrollment has a fallback name.

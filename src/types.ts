@@ -36,6 +36,7 @@ export type Job = {
   created: number;
   /** The session that asked, when the message was sent with one. Null for the client mailbox. */
   session: string | null;
+  event: "session_joined" | "session_returned" | null;
 };
 export interface Secrets {
   CAMELRUN_API_KEY: string;
