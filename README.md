@@ -321,11 +321,11 @@ Already downloaded copies stay with their recipients.
 
 Uploads are immutable and checksummed, with no application-imposed file-size cap, a default seven-day expiry and
 a one-to-365-day lifetime setting. The single-request upload path remains subject to Cloudflare's request-body
-limits and R2's single-part object limit. Upload and download credentials last at most 15 minutes and work only for their file, project,
+limits and R2's single-part object limit. Upload and download credentials last at most 24 hours and work only for their file, project,
 and direction. They also require the originating client and session to remain authorized. Keep these credentials
 private. Metadata and downloads fail closed at expiry. The room alarm removes expired or abandoned uploads and
-retries deletion after failures. Files abandoned before upload completion are reclaimed after an hour. Physical
-cleanup runs asynchronously. File contents are untrusted input.
+retries deletion after failures. Unfinished uploads remain available until their configured file expiry. Interrupted transfers can be retried
+with the same command while its credential is valid, restarting from the beginning. Physical cleanup runs asynchronously. File contents are untrusted input.
 
 The equivalent authenticated JSON routes are `POST send`, `POST message-status`, `POST prepare-upload`,
 `POST get-file`, `POST list-files`, and `POST delete-file` under `/projects/<project>/`. File transfer commands use

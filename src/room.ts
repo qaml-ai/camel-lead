@@ -692,7 +692,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     const current = this.accessFile(file.id, mailbox, client, mode === "upload");
     if (current.state === "deleted" || current.expires <= Date.now()) throw new Failure(404, "File unavailable");
     this.ctx.storage.sql.exec("DELETE FROM file_tokens WHERE expires<=?", Date.now());
-    const expires = Math.min(file.expires, Date.now() + 15 * 60_000);
+    const expires = Math.min(current.expires, Date.now() + 24 * 3600_000);
     this.ctx.storage.sql.exec("INSERT INTO file_tokens(hash,file,client,mailbox,mode,expires) VALUES(?,?,?,?,?,?)",
       digest, file.id, client, mailbox, mode, expires);
     return { file: current, token, expiresAt: new Date(expires).toISOString() };
@@ -754,8 +754,8 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     const now = Date.now();
     this.ctx.storage.sql.exec("DELETE FROM file_tokens WHERE expires<=?", now);
     const files = this.ctx.storage.sql.exec<SharedFile>(
-      "SELECT * FROM files WHERE cleaned<=? AND (state='deleted' OR expires<=? OR (state='pending' AND created<=?)) ORDER BY cleaned,id LIMIT 25",
-      now - 3600_000, now, now - 3600_000,
+      "SELECT * FROM files WHERE cleaned<=? AND (state='deleted' OR expires<=?) ORDER BY cleaned,id LIMIT 25",
+      now - 3600_000, now,
     ).toArray();
     for (const file of files) {
       this.ctx.storage.sql.exec("UPDATE files SET state='deleted',expires=min(expires,?) WHERE id=?", now, file.id);

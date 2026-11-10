@@ -65,7 +65,7 @@ export function registerSharingTools(server: McpServer, call: (tool: string, arg
     },
     {
       name: "prepare_upload",
-      description: "Prepare an immutable file upload. Supply its filename, byte size and SHA-256 hex digest, then run the returned curl command in the file's directory. Files expire after ttlDays (default 7). The upload token is private and expires in 15 minutes. Attach the returned file ID with send_message after uploading.",
+      description: "Prepare an immutable file upload. Supply its filename, byte size and SHA-256 hex digest, then run the returned curl command in the file's directory. Files expire after ttlDays (default 7). The upload token is private and expires in 24 hours. Attach the returned file ID with send_message after uploading.",
       schema: uploadInput,
     },
     {

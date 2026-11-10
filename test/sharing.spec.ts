@@ -107,6 +107,28 @@ describe("direct messaging and receipts", () => {
 });
 
 describe("file sharing", () => {
+  it("issues day-long credentials and preserves unfinished uploads until file expiry", async () => {
+    const before = Date.now();
+    const prepared = await tool("prepare_upload", { name: "slow.txt", size: 5, sha256: await hash("hello") });
+    expect(Date.parse(prepared.expiresAt)).toBeGreaterThanOrEqual(before + 24 * 3600_000);
+    expect(Date.parse(prepared.expiresAt)).toBeLessThanOrEqual(Date.now() + 24 * 3600_000);
+    await runInDurableObject(room(), (_o: ProjectRoom, state) => {
+      state.storage.sql.exec("UPDATE files SET created=? WHERE id=?", Date.now() - 2 * 3600_000, prepared.file.id);
+    });
+    await runDurableObjectAlarm(room());
+    expect((await transfer(prepared, "PUT", "hello")).status).toBe(200);
+    const download = await tool("get_file", { fileId: prepared.file.id });
+    expect(Date.parse(download.expiresAt)).toBeGreaterThanOrEqual(before + 24 * 3600_000);
+    expect(await (await transfer(download)).text()).toBe("hello");
+
+    const expiring = await tool("prepare_upload", { name: "expired.txt", size: 0, sha256: await hash(""), ttlDays: 1 });
+    expect(Date.parse(expiring.expiresAt)).toBe(expiring.file.expires);
+    await runInDurableObject(room(), (_o: ProjectRoom, state) => {
+      state.storage.sql.exec("UPDATE files SET expires=? WHERE id=?", Date.now() - 1, expiring.file.id);
+    });
+    await runDurableObjectAlarm(room());
+    expect((await transfer(expiring, "PUT", "")).ok).toBe(false);
+  });
   it("transfers binary content with concurrent, idempotent uploads", async () => {
     const content = new Uint8Array([0, 255, 128, 1, 13, 10]);
     const digest = Buffer.from(await crypto.subtle.digest("SHA-256", content)).toString("hex");
