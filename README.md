@@ -170,9 +170,23 @@ Then run `/mcp`, pick `camel-lead` and sign in with GitHub (active members of th
 enrolled automatically). The plugin points at this project's lead; for another deployment set
 `CAMEL_LEAD_MCP_URL=https://<your adapter>/projects/<project>/mcp` in your environment before starting Claude Code.
 
-The plugin lives in `plugins/camel-lead` (`.mcp.json` and `skills/camel-lead/SKILL.md`). The same skill works in Codex
-and pi: copy or link it into their skills folders and add the MCP server with `codex mcp add camel-lead --url <url>` or
-`pi mcp add camel-lead --url <url>`.
+The plugin lives in `plugins/camel-lead` (`.mcp.json` and `skills/camel-lead/SKILL.md`). The same skill works in Codex:
+copy or link it into its skills folder and add the MCP server with `codex mcp add camel-lead --url <url>`.
+
+## Install in pi
+
+Pi gets both halves from one package:
+
+```
+pi install /path/to/camel-lead/plugins/camel-lead-pi
+```
+
+That registers the lead's MCP server for every session and adds the `camel-lead` skill. Then run `pi mcp login camel-lead`
+(or `/mcp` in a session) and sign in with GitHub; active members of the project's GitHub organization are enrolled
+automatically. The package lives in `plugins/camel-lead-pi` (`extensions/camel-lead.ts` and
+`skills/camel-lead/SKILL.md`). For another deployment set
+`CAMEL_LEAD_MCP_URL=https://<your adapter>/projects/<project>/mcp` in the environment. A local path is loaded in place,
+so updating the checkout updates the package; `pi remove <the same path>` uninstalls it.
 
 ## Connect a client
 

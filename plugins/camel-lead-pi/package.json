@@ -1,0 +1,16 @@
+{
+  "name": "@qaml-ai/camel-lead-pi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi package for the shared project lead: the camel-lead MCP server plus the skill that teaches the agent to use it.",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions/camel-lead.ts"],
+    "skills": ["./skills"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
