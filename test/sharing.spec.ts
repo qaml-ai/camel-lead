@@ -295,6 +295,25 @@ describe("file sharing", () => {
     });
     expect((await read(undefined, alice)).events).toContainEqual(expect.objectContaining({ text: "delivered", requestId: submitted.requestId }));
   });
+  it.each(["message", "join"])("%s wakes lead work before an existing file-cleanup alarm", async (operation) => {
+    await upload();
+    // An idle cleanup pass leaves the next alarm an hour away.
+    await runDurableObjectAlarm(room());
+    const cleanupAlarm = await runInDurableObject(room(), (_o: ProjectRoom, state) => state.storage.getAlarm());
+    expect(cleanupAlarm).toBeGreaterThan(Date.now() + 3500_000);
+    const before = Date.now();
+    if (operation === "message") await tool("message", { text: "wake now", requestId: "wake-before-cleanup" });
+    else await join("wake-before-cleanup");
+    const alarm = await runInDurableObject(room(), (_o: ProjectRoom, state) => state.storage.getAlarm());
+    expect(alarm).toBeGreaterThanOrEqual(before + 1000);
+    expect(alarm).toBeLessThanOrEqual(Date.now() + 1000);
+  });
+  it("new lead work preserves an earlier alarm", async () => {
+    const due = Date.now() + 500;
+    await runInDurableObject(room(), (_o: ProjectRoom, state) => state.storage.setAlarm(due));
+    await tool("message", { text: "keep earlier wake", requestId: "keep-earlier" });
+    expect(await runInDurableObject(room(), (_o: ProjectRoom, state) => state.storage.getAlarm())).toBe(due);
+  });
 });
 
 it("migrates existing messages and deliveries without rewriting their data", async () => {

@@ -323,6 +323,12 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
   private liveSessions(client: string, now: number) {
     return this.sessionsOf(client).filter((s) => s.seen > now - SESSION_LIVE_MS || this.open(s.id).length > 0);
   }
+  /** New lead work must preempt the hourly file-cleanup alarm without delaying an earlier wake-up. */
+  private async wakeLead() {
+    const due = Date.now() + 1000;
+    const alarm = await this.ctx.storage.getAlarm();
+    if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
+  }
   /**
    * Create or resume a named session under the calling client. The same name is always the same session id,
    * so an agent that lost its context gets its mailbox back by joining again.
@@ -335,8 +341,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     const known = this.clients(project);
     if (Object.hasOwn(known, id)) throw new Failure(409, "Session name conflicts with a configured client");
     // Arm delivery before atomically writing the session and its event.
-    if ((await this.ctx.storage.getAlarm()) === null)
-      await this.ctx.storage.setAlarm(Date.now() + 1000);
+    await this.wakeLead();
     const now = Date.now(),
       sql = this.ctx.storage.sql;
     this.expireSessions(now);
@@ -383,8 +388,7 @@ export class ProjectRoom extends DurableObject<WorkerEnv> {
     // Two sessions of one client may reuse a requestId; without a session the id is what it always was.
     const scope = mailbox === client ? `${project}:${client}` : `${project}:${client}:${mailbox}`;
     const id = "lead_" + (await hash(`${scope}:${requestId}`)).slice(0, 48);
-    if ((await this.ctx.storage.getAlarm()) === null)
-      await this.ctx.storage.setAlarm(Date.now() + 1000);
+    await this.wakeLead();
     const old = this.ctx.storage.sql
       .exec<Job>("SELECT * FROM jobs WHERE id=?", id)
       .toArray()[0];
